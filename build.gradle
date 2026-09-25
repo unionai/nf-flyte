@@ -1,0 +1,20 @@
+plugins {
+    id 'io.nextflow.nextflow-plugin' version '1.0.0-beta.15'
+}
+
+version = '0.1.0'
+
+// Build and test against another Nextflow line with e.g. ./gradlew test -PnxfVersion=26.04.6
+def nxfVersion = findProperty('nxfVersion') ?: '25.10.0'
+
+nextflowPlugin {
+    nextflowVersion = nxfVersion
+
+    provider = 'unionai'
+    description = 'Runs Nextflow tasks as Flyte v2 actions'
+    className = 'unionai.plugin.FlytePlugin'
+    extensionPoints = [
+        'unionai.plugin.config.FlyteConfig',
+        'unionai.plugin.executor.FlyteExecutor',
+    ]
+}
