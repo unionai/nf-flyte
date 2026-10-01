@@ -4,6 +4,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 import nextflow.exception.ProcessException
+import com.google.common.hash.HashCode
+import nextflow.processor.TaskProcessor
 import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
 import spock.lang.Specification
@@ -53,6 +55,34 @@ class FlyteTaskHandlerTest extends Specification {
         'ACTION_PHASE_RUNNING'              | true
         'ACTION_PHASE_SUCCEEDED'            | true   // finished between polls
         'ACTION_PHASE_FAILED'               | true
+    }
+
+    def 'should name a cacheable task after its cache key and attempt, so a resumed task keeps its name'() {
+        given:
+        def processor = Mock(TaskProcessor) { isCacheable() >> true }
+        def task = Mock(TaskRun) {
+            getProcessor() >> processor
+            getFailCount() >> 1
+            getHash() >> HashCode.fromString(hash)
+        }
+
+        expect: 'Nextflow gives a resumed in-flight task a new hash, but the name stays the same'
+        FlyteTaskHandler.actionNameFor(task, 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4') == 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-1'
+
+        where:
+        hash << ['0123456789abcdef0123456789abcdef', 'fedcba9876543210fedcba9876543210']
+    }
+
+    def 'should name a non-cacheable task after its hash'() {
+        given:
+        def processor = Mock(TaskProcessor) { isCacheable() >> false }
+        def task = Mock(TaskRun) {
+            getProcessor() >> processor
+            getHash() >> HashCode.fromString('0123456789abcdef0123456789abcdef')
+        }
+
+        expect:
+        FlyteTaskHandler.actionNameFor(task, 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4') == 'nf-0123456789abcdef01234567'
     }
 
     static Map outputs(Path taskDir) {

@@ -113,6 +113,7 @@ class FlyteActionBuilderTest extends Specification {
     def 'should derive action and short names'() {
         expect:
         FlyteActionBuilder.actionName('3F5A9C0D1E2B4A6C8D0E2F4A6B8C0D1E') == 'nf-3f5a9c0d1e2b4a6c8d0e2f4a'
+        FlyteActionBuilder.actionName('3f5a9c0d1e2b4a6c8d0e2f4a6b8c0d1e', 2) == 'nf-3f5a9c0d1e2b4a6c8d0e2f4a-2'
         FlyteActionBuilder.shortName('NFCORE_RNASEQ:RNASEQ:FASTQC') == 'nf.FASTQC'
         FlyteActionBuilder.shortName('foo (1)') == 'nf.foo__1_'
     }

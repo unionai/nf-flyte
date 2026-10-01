@@ -65,8 +65,9 @@ class FlyteClient {
             call('flyteidl2.actions.ActionsService/Enqueue', [action: action], routing(id, action.parentActionName as String))
         }
         catch( AlreadyExistsException e ) {
-            // action names come from the task hash: when a retried Nextflow head resubmits a task
-            // that was still running (or done) under the failed attempt, attach to that action
+            // action names come from the task's cache key and attempt: when a retried Nextflow head
+            // resubmits a task that was still running (or done) under the failed attempt, attach to
+            // that action
             log.debug "[FLYTE] action ${id.name} already exists, attaching to it"
         }
     }

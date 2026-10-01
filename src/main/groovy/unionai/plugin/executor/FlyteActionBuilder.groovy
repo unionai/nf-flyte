@@ -150,6 +150,14 @@ class FlyteActionBuilder {
     }
 
     /**
+     * Action name from a task's cache key and Nextflow attempt (`failCount`), which, unlike the
+     * task hash, stay the same when a retried head resumes the task.
+     */
+    static String actionName(String cacheKey, int failCount) {
+        return actionName(cacheKey) + '-' + failCount
+    }
+
+    /**
      * Short, UI-friendly name from the process name, e.g. `NFCORE_RNASEQ:RNASEQ:FASTQC` -> `nf.FASTQC`.
      */
     static String shortName(String processName) {
