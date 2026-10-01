@@ -115,10 +115,11 @@ class FlyteClientTest extends Specification {
         server.alreadyExists = true
 
         when:
-        client.enqueue([actionId: [run: [project: 'p', domain: 'd', name: 'r1'], name: 'nf-a'], parentActionName: 'a0'])
+        def created = client.enqueue([actionId: [run: [project: 'p', domain: 'd', name: 'r1'], name: 'nf-a'], parentActionName: 'a0'])
 
         then:
         noExceptionThrown()
+        !created
         server.requests['flyteidl2.actions.ActionsService/Enqueue'].size() == 1
     }
 

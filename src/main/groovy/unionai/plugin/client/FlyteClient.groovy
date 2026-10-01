@@ -58,17 +58,21 @@ class FlyteClient {
      * Enqueue an action (`flyteidl2.actions.ActionsService/Enqueue`).
      *
      * @param action a JSON-shaped `flyteidl2.actions.Action`
+     * @return {@code false} when an action with that name already exists, and the caller is
+     *      attached to it instead
      */
-    void enqueue(Map action) {
+    boolean enqueue(Map action) {
         final id = action.actionId as Map
         try {
             call('flyteidl2.actions.ActionsService/Enqueue', [action: action], routing(id, action.parentActionName as String))
+            return true
         }
         catch( AlreadyExistsException e ) {
             // action names come from the task's cache key and attempt: when a retried Nextflow head
             // resubmits a task that was still running (or done) under the failed attempt, attach to
             // that action
             log.debug "[FLYTE] action ${id.name} already exists, attaching to it"
+            return false
         }
     }
 

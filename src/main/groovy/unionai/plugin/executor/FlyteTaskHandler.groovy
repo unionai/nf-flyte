@@ -79,7 +79,14 @@ class FlyteTaskHandler extends TaskHandler {
 
         taskKey = cacheKey()
         actionName = actionNameFor(task, taskKey)
-        executor.client.enqueue(newAction(writeInputs()))
+        final inputs = writeInputs()
+        if( !executor.client.enqueue(newAction(inputs)) && isAborted(actionName) ) {
+            // the failed head aborted this action when it shut down (Nextflow kills its running
+            // tasks on SIGTERM): run the task again, under its hash, which is new in this session
+            log.debug "[FLYTE] Action $actionName was aborted by a previous attempt, running the task again"
+            actionName = FlyteActionBuilder.actionName(task.hash.toString())
+            executor.client.enqueue(newAction(inputs))
+        }
         status = TaskStatus.SUBMITTED
         log.debug "[FLYTE] Process `${task.lazyName()}` submitted > action=$actionName; work-dir=${task.workDirStr}"
     }
@@ -95,6 +102,11 @@ class FlyteTaskHandler extends TaskHandler {
         return task.processor.isCacheable()
             ? FlyteActionBuilder.actionName(key, task.failCount)
             : FlyteActionBuilder.actionName(task.hash.toString())
+    }
+
+    private boolean isAborted(String name) {
+        final details = executor.client.getActionDetails(FlyteActionBuilder.actionId(executor.flyteConfig, name))
+        return ((details?.status as Map)?.phase as String) == 'ACTION_PHASE_ABORTED'
     }
 
     /**
