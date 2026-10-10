@@ -41,6 +41,8 @@ class FlyteTaskHandler extends TaskHandler {
     private final Path exitFile
 
     @PackageScope String actionName
+    /** The task's {@link #cacheKey()}, computed once on submit */
+    @PackageScope String taskKey
     @PackageScope List<StagedInput> stagedInputs
 
     FlyteTaskHandler(TaskRun task, FlyteExecutor executor) {
@@ -75,10 +77,36 @@ class FlyteTaskHandler extends TaskHandler {
         if( !task.container )
             throw new ProcessUnrecoverableException("Process `${task.lazyName()}` failed because the `flyte` executor requires a container image -- set the `container` directive")
 
-        actionName = FlyteActionBuilder.actionName(task.hash.toString())
-        executor.client.enqueue(newAction(writeInputs()))
+        taskKey = cacheKey()
+        actionName = actionNameFor(task, taskKey)
+        final inputs = writeInputs()
+        if( !executor.client.enqueue(newAction(inputs)) && isAborted(actionName) ) {
+            // the failed head aborted this action when it shut down (Nextflow kills its running
+            // tasks on SIGTERM): run the task again, under its hash, which is new in this session
+            log.debug "[FLYTE] Action $actionName was aborted by a previous attempt, running the task again"
+            actionName = FlyteActionBuilder.actionName(task.hash.toString())
+            executor.client.enqueue(newAction(inputs))
+        }
         status = TaskStatus.SUBMITTED
         log.debug "[FLYTE] Process `${task.lazyName()}` submitted > action=$actionName; work-dir=${task.workDirStr}"
+    }
+
+    /**
+     * Name a cacheable task's action after its cache key and attempt, not its Nextflow hash: when
+     * a retried head resumes a task that was still running, Nextflow finds its work dir and moves
+     * it to a new hash, but the key and attempt stay the same, so the enqueue attaches to the
+     * running action instead of starting another. A process with `cache false` keeps its hash,
+     * so two runs of it with the same inputs stay separate actions.
+     */
+    static String actionNameFor(TaskRun task, String key) {
+        return task.processor.isCacheable()
+            ? FlyteActionBuilder.actionName(key, task.failCount)
+            : FlyteActionBuilder.actionName(task.hash.toString())
+    }
+
+    private boolean isAborted(String name) {
+        final details = executor.client.getActionDetails(FlyteActionBuilder.actionId(executor.flyteConfig, name))
+        return ((details?.status as Map)?.phase as String) == 'ACTION_PHASE_ABORTED'
     }
 
     /**
@@ -125,7 +153,7 @@ class FlyteTaskHandler extends TaskHandler {
         builder.inputsUri = inputsUriCache
         builder.inputs = inputs.collectEntries { name, input -> [name, input.dir] } as Map<String,Boolean>
         if( executor.flyteConfig.cache && task.processor.isCacheable() )
-            builder.cacheKey = cacheKey()
+            builder.cacheKey = taskKey
         return builder.build()
     }
 

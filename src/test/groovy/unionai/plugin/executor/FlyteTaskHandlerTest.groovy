@@ -3,7 +3,9 @@ package unionai.plugin.executor
 import java.nio.file.Files
 import java.nio.file.Path
 
+import com.google.common.hash.HashCode
 import nextflow.exception.ProcessException
+import nextflow.processor.TaskProcessor
 import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
 import spock.lang.Specification
@@ -55,8 +57,81 @@ class FlyteTaskHandlerTest extends Specification {
         'ACTION_PHASE_FAILED'               | true
     }
 
+    def 'should name a cacheable task after its cache key and attempt, so a resumed task keeps its name'() {
+        given:
+        def processor = Mock(TaskProcessor) { isCacheable() >> true }
+        def task = Mock(TaskRun) {
+            getProcessor() >> processor
+            getFailCount() >> 1
+            getHash() >> HashCode.fromString(hash)
+        }
+
+        expect: 'Nextflow gives a resumed in-flight task a new hash, but the name stays the same'
+        FlyteTaskHandler.actionNameFor(task, 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4') == 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-1'
+
+        where:
+        hash << ['0123456789abcdef0123456789abcdef', 'fedcba9876543210fedcba9876543210']
+    }
+
+    def 'should name a non-cacheable task after its hash'() {
+        given:
+        def processor = Mock(TaskProcessor) { isCacheable() >> false }
+        def task = Mock(TaskRun) {
+            getProcessor() >> processor
+            getHash() >> HashCode.fromString('0123456789abcdef0123456789abcdef')
+        }
+
+        expect:
+        FlyteTaskHandler.actionNameFor(task, 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4') == 'nf-0123456789abcdef01234567'
+    }
+
     static Map outputs(Path taskDir) {
         [outputs: [literals: [[name: 'task_dir', value: [scalar: [blob: [uri: taskDir.toString()]]]]]]]
+    }
+
+    FlyteTaskHandler submittable(Map details) {
+        def processor = Mock(TaskProcessor) { isCacheable() >> true }
+        def task = Mock(TaskRun) {
+            getWorkDir() >> workDir
+            getContainer() >> 'ubuntu'
+            getProcessor() >> processor
+            getFailCount() >> 0
+            getHash() >> HashCode.fromString('0123456789abcdef0123456789abcdef')
+        }
+        def h = Spy(FlyteTaskHandler, constructorArgs: [task, executor])
+        h.cacheKey() >> 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4'
+        h.writeInputs() >> [:]
+        h.newAction(_) >> { [name: h.@actionName] }
+        client.getActionDetails([run: [org: 'acme', project: 'proj', domain: 'development', name: 'r123'], name: 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-0']) >> details
+        return h
+    }
+
+    def 'should attach to an action a previous attempt left running'() {
+        given:
+        def h = submittable([status: [phase: 'ACTION_PHASE_RUNNING']])
+
+        when:
+        h.submit()
+
+        then:
+        1 * client.enqueue([name: 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-0']) >> false
+        0 * client.enqueue(_)
+        h.@actionName == 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-0'
+        h.status == TaskStatus.SUBMITTED
+    }
+
+    def 'should run the task again when a previous attempt aborted its action'() {
+        given:
+        def h = submittable([status: [phase: 'ACTION_PHASE_ABORTED']])
+
+        when:
+        h.submit()
+
+        then:
+        1 * client.enqueue([name: 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-0']) >> false
+        1 * client.enqueue([name: 'nf-0123456789abcdef01234567']) >> true
+        h.@actionName == 'nf-0123456789abcdef01234567'
+        h.status == TaskStatus.SUBMITTED
     }
 
     def 'should copy the task dir output into the work dir on success'() {
