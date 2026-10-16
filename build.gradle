@@ -10,7 +10,7 @@ def nxfVersion = findProperty('nxfVersion') ?: '25.10.0'
 nextflowPlugin {
     nextflowVersion = nxfVersion
 
-    provider = 'unionai'
+    provider = 'Union AI'
     description = 'Runs Nextflow tasks as Flyte v2 actions'
     className = 'unionai.plugin.FlytePlugin'
     extensionPoints = [
