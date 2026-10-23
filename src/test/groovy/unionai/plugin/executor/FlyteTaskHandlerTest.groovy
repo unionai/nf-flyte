@@ -60,6 +60,24 @@ class FlyteTaskHandlerTest extends Specification {
         return h
     }
 
+    def 'should copy a task dir with nested directories into a local work dir'() {
+        given:
+        def source = workDir.resolve('task_dir')
+        Files.createDirectories(source.resolve('bbsplit_index/ref/genome/1'))
+        source.resolve('bbsplit_index/ref/genome/1/info.txt').text = 'info'
+        source.resolve('Coverage Profile Along Genes (High).png').text = 'png'
+        source.resolve('out.txt').text = 'out'
+        def target = workDir.resolve('work/ab/cdef')
+
+        when:
+        FlyteTaskHandler.copyTree(source, target)
+
+        then:
+        target.resolve('bbsplit_index/ref/genome/1/info.txt').text == 'info'
+        target.resolve('out.txt').text == 'out'
+        target.resolve('Coverage Profile Along Genes (High).png').text == 'png'
+    }
+
     def 'should not be running until the action has started'() {
         given:
         def h = handler(TaskStatus.SUBMITTED)
