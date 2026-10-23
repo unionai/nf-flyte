@@ -1,0 +1,259 @@
+syntax = "proto3";
+
+package flyteidl2.task;
+
+import "buf/validate/validate.proto";
+import "flyteidl2/common/identifier.proto";
+import "flyteidl2/common/phase.proto";
+import "flyteidl2/common/run.proto";
+import "flyteidl2/core/literals.proto";
+import "flyteidl2/core/security.proto";
+import "flyteidl2/core/tasks.proto";
+import "flyteidl2/notification/definition.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+option go_package = "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/task";
+
+// Label values to be applied to an execution resource.
+// In the future a mode (e.g. OVERRIDE, APPEND, etc) can be defined
+// to specify how to merge labels defined at registration and execution time.
+message Labels {
+  // Map of custom labels to be applied to the execution resource.
+  map<string, string> values = 1;
+}
+
+// Annotation values to be applied to an execution resource.
+// In the future a mode (e.g. OVERRIDE, APPEND, etc) can be defined
+// to specify how to merge annotations defined at registration and execution time.
+message Annotations {
+  // Map of custom annotations to be applied to the execution resource.
+  map<string, string> values = 1;
+}
+
+// Environment variable values to be applied to an execution resource.
+// In the future a mode (e.g. OVERRIDE, APPEND, etc) can be defined
+// to specify how to merge environment variables defined at registration and execution time.
+message Envs {
+  // Map of custom environment variables to be applied to the execution resource.
+  repeated flyteidl2.core.KeyValuePair values = 1;
+}
+
+message RawDataStorage {
+  // Prefix for where offloaded data from user actions will be written
+  // e.g. s3://bucket/key or s3://bucket/
+  string raw_data_prefix = 1;
+}
+
+enum CacheLookupScope {
+  // CACHE_LOOKUP_SCOPE_UNSPECIFIED instructs cache lookup to follow the default behavior (global unless configured
+  // otherwise)
+  CACHE_LOOKUP_SCOPE_UNSPECIFIED = 0;
+
+  // CACHE_LOOKUP_SCOPE_GLOBAL instructs cache lookups to do a global lookup (unless overridden by a system config).
+  // This has traditionally been the default behavior. It requires all workloads running in all projects/domains
+  // to have access to the same artifacts/buckets. Otherwise it risks runtime failures.
+  CACHE_LOOKUP_SCOPE_GLOBAL = 1;
+
+  // CACHE_LOOKUP_SCOPE_PROJECT_DOMAIN instructs cache lookups to do a project-domain scoped lookup. This ensures
+  // data access success at the expense of potentially more cache misses and recomputation happening. This should not
+  // be considered a security enforcement (that can happen through the system-wide config).
+  CACHE_LOOKUP_SCOPE_PROJECT_DOMAIN = 2;
+}
+
+// CacheConfig contains configurations that influence the behavior of cache reads and writes
+message CacheConfig {
+  // If true, recompute outputs for this run and overwrite any existing cache.
+  bool overwrite_cache = 1;
+
+  // CacheLookupScope defines the cache lookup behavior. If left unspecified, the default value from the system config
+  // will be used (global unless configured otherwise).
+  CacheLookupScope cache_lookup_scope = 2;
+}
+
+// Recover carries the optional configuration of a recovery run — a run created
+// with RunSpec.relation.relation_type = RELATION_TYPE_RECOVER. The run being
+// recovered is RunSpec.relation.related_to; this message intentionally carries no
+// run reference of its own. It is the extension point for future recovery
+// parameters.
+message Recover {
+  // Escape hatch: names of actions that must always re-execute in this recovery
+  // run, even if they succeeded in the run being recovered. A listed parent
+  // action re-executes and therefore re-enqueues its children, each of which goes
+  // through the recovery decision individually (list them too to force the whole
+  // subtree). A listed condition action re-pauses and waits for a new signal.
+  // Unknown names are ignored.
+  repeated string force_rerun_actions = 1 [(buf.validate.field).repeated.items.string.min_len = 1];
+}
+
+// TaskSpecSource records how a run's task spec was provided at creation time, so
+// the rerun UI can send a TaskId (deployed) rather than the full inline spec.
+enum TaskSpecSource {
+  TASK_SPEC_SOURCE_UNSPECIFIED = 0;
+
+  // The run referenced a deployed (registered) task by TaskId.
+  TASK_SPEC_SOURCE_DEPLOYED = 1;
+
+  // The run carried an inline task spec (e.g. fast registration) that does not
+  // exist in the task store.
+  TASK_SPEC_SOURCE_EPHEMERAL = 2;
+}
+
+message RunSpec {
+  // Labels to apply to the run.
+  Labels labels = 1;
+
+  // Annotations to apply to the run.
+  Annotations annotations = 2;
+
+  // Envs to apply to the run.
+  Envs envs = 3;
+
+  // Explicit override for executing this run as interruptible or not. If not set, use the default.
+  google.protobuf.BoolValue interruptible = 4;
+
+  // If true, recompute outputs for this run and overwrite any existing cache.
+  // Deprecated, please use CacheConfig.OverwriteCache instead
+  bool overwrite_cache = 5 [deprecated = true];
+
+  // The queue name that this run should be executed on.
+  // This value will be used as the default for all actions in the run unless overridden in TaskAction.queue.
+  // Queue name is unique within an org so it can be used as an id to reference the queue.
+  string queue = 6;
+  reserved "cluster";
+
+  // Encapsulates user settings pertaining to offloaded data (i.e. Blobs, Schema, query data, etc.).
+  RawDataStorage raw_data_storage = 7;
+
+  // SecurityContext holds security attributes that apply to tasks.
+  flyteidl2.core.SecurityContext security_context = 8;
+
+  // CacheConfig contains configurations that influence the behavior of cache reads and writes
+  CacheConfig cache_config = 9;
+
+  // Optionally, you can send a notification when your run completes.
+  oneof notification_settings {
+    string notification_rule_name = 10; // either refer to a previously stored notification rule
+
+    InlineRuleList notification_rules = 11; // either define an inline one-off rule
+  }
+
+  // The time at which the run was started. For scheduled-trigger runs this is the trigger's
+  // scheduled fire time; for ad-hoc runs the server defaults it to run-creation time. It is
+  // substituted into the {{.runStartTime}} container-arg template so task code can read it via
+  // flyte.ctx().run_start_time (SDK >= 2.3.6). Older task templates omit the placeholder, so
+  // the substitution is a harmless no-op for them.
+  google.protobuf.Timestamp run_start_time = 12;
+
+  // Maximum number of actions of this run that may execute concurrently.
+  // 0 (unset) means unlimited. Enforced by the scheduler in addition to any
+  // queue-level concurrency limits (min wins): actions beyond the limit stay
+  // queued until a running action of this run completes.
+  uint32 max_action_concurrency = 13;
+
+  // Base directory under which the run's metadata (inputs.pb, per-action
+  // outputs.pb, action metadata) is written. When set, it overrides the
+  // org/project/domain settings default and the dataplane cluster default.
+  // Leave empty to fall back to settings, then to the cluster default.
+  // Distinct from raw_data_storage.raw_data_prefix, which controls offloaded
+  // blob (user data) layout.
+  string run_base_dir = 14;
+
+  // Deprecated: use relation instead. Optional pointer to the single parent run this run
+  // was derived from. If set and relation is unset, the server normalizes it into relation
+  // with RELATION_TYPE_RERUN.
+  flyteidl2.common.RunIdentifier related_to = 15 [deprecated = true];
+
+  // Pool of the assigned queue for given run.
+  // Always set by server. Should not be specified by user.
+  string cluster_pool = 16;
+
+  // How the task spec was provided at creation (deployed TaskId vs inline spec).
+  // Set by server; lets the rerun UI choose TaskId over the full inline spec.
+  TaskSpecSource task_spec_source = 17;
+
+  // Optional provenance link to the single parent run this run was derived from
+  // (re-run or recover). Set at creation, immutable thereafter, and scoped to the
+  // same org/project/domain as this run. Replaces related_to.
+  flyteidl2.common.Relation relation = 18;
+
+  // Optional recovery configuration. Only meaningful when relation is set with
+  // RELATION_TYPE_RECOVER: the run recovers relation.related_to — its successful
+  // actions are reused and only failed/changed ones re-execute. See Recover.
+  Recover recover = 19;
+
+  // Run-scoped defaults, projected onto every task in the run that does not
+  // set the corresponding value itself. Set by the server from settings.
+  DefaultSettings default_settings = 20;
+}
+
+// DefaultSettings holds run-scoped defaults applied to tasks in a run. Each field
+// only fills in a value the task leaves unset; a task's own choice always wins.
+message DefaultSettings {
+  // Pod template name, projected onto tasks that do not name one themselves.
+  // A task's own TaskMetadata.pod_template_name always wins.
+  string pod_template_name = 1;
+
+  // Resource defaults for every action in this run. Resolved by the server at creation from the org, project and
+  // domain task_resource settings; a caller-supplied value is currently overwritten.
+  TaskResourceDefaults task_resource_defaults = 2;
+}
+
+// Resolved task_resource settings for a run: what a task pod gets when its template is silent, and the ceiling
+// either way. Deliberately not a flyteidl2.core.Resources: max is a ceiling on both a task's requests and its
+// limits, not a Kubernetes limit.
+message TaskResourceDefaults {
+  // Request for each dimension a task template leaves unset (task_resource.min, capped at max).
+  repeated flyteidl2.core.Resources.ResourceEntry requests = 1;
+
+  // Per-dimension cap on a task's requests and limits (task_resource.max).
+  repeated flyteidl2.core.Resources.ResourceEntry max = 2;
+
+  // Accelerator for a task that requests GPUs but names none
+  // (task_resource.default_accelerator). Its device is an AcceleratorModel
+  // accelerator_name string. Unset when no scope sets one. The server
+  // resolves it; a task's own gpu_accelerator always wins.
+  flyteidl2.core.GPUAccelerator default_accelerator = 3;
+}
+
+message InlineRuleList {
+  repeated InlineRule rules = 1 [(buf.validate.field).repeated.min_items = 1];
+}
+
+message InlineRule {
+  // A rule's delivery template compiles against exactly one template data
+  // shape, so PAUSED (ActionPausedNotificationTemplateData) cannot be mixed
+  // with terminal phases (RunCompletedNotificationTemplateData) in one rule.
+  option (buf.validate.message).cel = {
+    id: "paused_rule_exclusive"
+    message: "a rule subscribing to ACTION_PHASE_PAUSED must not subscribe to other phases"
+    expression: "!(flyteidl2.common.ActionPhase.ACTION_PHASE_PAUSED in this.on_phases) || this.on_phases.size() == 1"
+  };
+
+  repeated common.ActionPhase on_phases = 1 [(buf.validate.field).repeated = {
+    min_items: 1
+    unique: true
+    items: {
+      enum: {
+        in: [ // terminal phases, plus PAUSED (condition awaiting a signal)
+          5, // ACTION_PHASE_SUCCEEDED
+          6, // ACTION_PHASE_FAILED
+          7, // ACTION_PHASE_ABORTED
+          8, // ACTION_PHASE_TIMED_OUT
+          9 // ACTION_PHASE_PAUSED
+        ]
+      }
+    }
+  }];
+
+  oneof delivery {
+    option (buf.validate.oneof).required = true;
+
+    // (run org + delivery_config_name) will be used as a delivery config id
+    string delivery_config_name = 2;
+
+    // template can only have fields defined in flyteidl2.notification.RunCompletedNotificationTemplateData
+    // (terminal-phase rules) or flyteidl2.notification.ActionPausedNotificationTemplateData (PAUSED rules)
+    flyteidl2.notification.DeliveryConfigTemplate delivery_template = 3;
+  }
+}

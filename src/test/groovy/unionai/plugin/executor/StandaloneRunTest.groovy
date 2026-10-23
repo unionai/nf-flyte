@@ -4,10 +4,19 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
+import flyteidl2.common.Identifier.ActionIdentifier
+import flyteidl2.common.Identifier.RunIdentifier
+import flyteidl2.core.Tasks.RuntimeMetadata
+import flyteidl2.common.Run.OffloadedInputData
+import flyteidl2.dataproxy.DataproxyService.UploadInputsRequest
+import flyteidl2.workflow.RunDefinition.Action
+import flyteidl2.workflow.RunDefinition.Run
+import flyteidl2.workflow.RunServiceOuterClass.CreateRunRequest
+import flyteidl2.workflow.RunServiceOuterClass.GetActionDataURIsResponse
 import spock.lang.Specification
 import spock.lang.TempDir
 import spock.lang.Timeout
-import unionai.plugin.client.FlyteClient
+import unionai.flyte.controller.RunClient
 import unionai.plugin.config.FlyteConfig
 
 class StandaloneRunTest extends Specification {
@@ -20,20 +29,34 @@ class StandaloneRunTest extends Specification {
         new FlyteConfig([endpoint: 'tenant.example.com', org: 'acme', project: 'proj', domain: 'development'], [FLYTE_API_KEY: 'k'])
     }
 
+    static RunIdentifier runId(String name) {
+        RunIdentifier.newBuilder().setOrg('acme').setProject('proj').setDomain('development').setName(name).build()
+    }
+
+    static Run created(String name) {
+        Run.newBuilder().setAction(Action.newBuilder().setId(ActionIdentifier.newBuilder().setRun(runId(name)).setName('a0'))).build()
+    }
+
+    static GetActionDataURIsResponse uris(String inputsUri) {
+        GetActionDataURIsResponse.newBuilder().setInputsUri(inputsUri).build()
+    }
+
     def 'should create the run and point the executor at it'() {
         given:
         def config = laptopConfig()
-        def client = Mock(FlyteClient)
-        def run = new StandaloneRun(config, client, workDir)
-        Map request
+        def runs = Mock(RunClient)
+        def run = new StandaloneRun(config, runs, workDir)
+        CreateRunRequest request
+        UploadInputsRequest upload
 
         when:
         run.start()
 
-        then:
-        1 * client.createRun(_) >> { args -> request = args[0]; [action: [id: [run: [org: 'acme', project: 'proj', domain: 'development', name: 'r42']]]] }
-        1 * client.getActionDataUris([run: [org: 'acme', project: 'proj', domain: 'development', name: 'r42'], name: 'a0']) >>
-            [inputsUri: 's3://bucket/metadata/v2/acme/proj/development/r42/a0/inputs.pb']
+        then: 'empty inputs are stored first, as the Flyte SDK does'
+        1 * runs.uploadInputs(_) >> { args -> upload = args[0]; OffloadedInputData.newBuilder().setUri('s3://b/offloaded/inputs.pb').setInputsHash('h').build() }
+        1 * runs.createRun(_) >> { args -> request = args[0]; created('r42') }
+        1 * runs.getActionDataUris(ActionIdentifier.newBuilder().setRun(runId('r42')).setName('a0').build()) >>
+            uris('s3://bucket/metadata/v2/acme/proj/development/r42/a0/inputs.pb')
 
         and: 'task actions go into the new run, under its root'
         config.runName == 'r42'
@@ -42,16 +65,28 @@ class StandaloneRunTest extends Specification {
         run.url() == 'https://tenant.example.com/v2/domain/development/project/proj/runs/r42'
 
         and: 'the root is a waiter on the head, with a v2 runtime version'
-        request.projectId == [organization: 'acme', name: 'proj', domain: 'development']
+        request.runId.project == 'proj'
+        request.runId.domain == 'development'
         def tmpl = request.taskSpec.taskTemplate
         tmpl.type == 'container'
-        tmpl.metadata.runtime == [type: 'OTHER', flavor: 'nextflow', version: '2.10.0']
-        tmpl.metadata.retries == [retries: 0]
+        tmpl.metadata.runtime.type == RuntimeMetadata.RuntimeType.OTHER
+        tmpl.metadata.runtime.flavor == 'nextflow'
+        tmpl.metadata.runtime.version == '2.10.0'
+        tmpl.metadata.retries.retries == 0
         tmpl.container.image == FlyteConfig.DEFAULT_ROOT_IMAGE
-        tmpl.container.command[0..2] == ['python', '-c', StandaloneRun.WATCHER]
-        tmpl.container.command[3] == run.statusFile.toUriString()
-        tmpl.container.command[4] == run.heartbeatFile.toUriString()
-        tmpl.container.command[5] == '300'
+        tmpl.container.commandList[0..2] == ['python', '-c', StandaloneRun.WATCHER]
+        tmpl.container.commandList[3] == run.statusFile.toUriString()
+        tmpl.container.commandList[4] == run.heartbeatFile.toUriString()
+        tmpl.container.commandList[5] == '300'
+        tmpl.container.commandList[6] == '{{.outputPrefix}}'
+
+        and: 'the run is named up front and references the inputs stored under it'
+        upload.inputs.literalsCount == 0
+        upload.taskSpec == request.taskSpec
+        upload.runId == request.runId
+        request.runId.name ==~ /nf[a-z0-9]{18}/
+        request.runId.org == 'acme'
+        request.offloadedInputData.uri == 's3://b/offloaded/inputs.pb'
 
         and: 'a heartbeat is written before the root starts watching'
         Files.exists(run.heartbeatFile)
@@ -61,13 +96,35 @@ class StandaloneRunTest extends Specification {
         run.finish(true)
     }
 
+    def 'should use its own run name when a retried create finds the run'() {
+        given:
+        def config = laptopConfig()
+        def runs = Mock(RunClient) {
+            uploadInputs(_) >> OffloadedInputData.newBuilder().setUri('s3://b/offloaded/inputs.pb').setInputsHash('h').build()
+            createRun(_) >> null
+            getActionDataUris(_) >> { args -> uris("s3://b/${args[0].run.name}/a0/inputs.pb") }
+        }
+        def run = new StandaloneRun(config, runs, workDir)
+
+        when:
+        run.start()
+
+        then:
+        config.runName ==~ /nf[a-z0-9]{18}/
+        config.runOutputBase == "s3://b/${config.runName}"
+
+        cleanup:
+        run.finish(true)
+    }
+
     def 'should report how the pipeline ended'() {
         given:
-        def client = Mock(FlyteClient) {
-            createRun(_) >> [action: [id: [run: [name: 'r1']]]]
-            getActionDataUris(_) >> [inputsUri: 's3://b/r1/a0/inputs.pb']
+        def runs = Mock(RunClient) {
+            uploadInputs(_) >> OffloadedInputData.newBuilder().setUri('s3://b/offloaded/inputs.pb').setInputsHash('h').build()
+            createRun(_) >> created('r1')
+            getActionDataUris(_) >> uris('s3://b/r1/a0/inputs.pb')
         }
-        def run = new StandaloneRun(laptopConfig(), client, workDir)
+        def run = new StandaloneRun(laptopConfig(), runs, workDir)
         run.start()
 
         when:
@@ -84,29 +141,31 @@ class StandaloneRunTest extends Specification {
 
     def 'should abort the run when the user stops Nextflow'() {
         given:
-        def client = Mock(FlyteClient) {
-            createRun(_) >> [action: [id: [run: [org: 'acme', project: 'proj', domain: 'development', name: 'r1']]]]
-            getActionDataUris(_) >> [inputsUri: 's3://b/r1/a0/inputs.pb']
+        def runs = Mock(RunClient) {
+            uploadInputs(_) >> OffloadedInputData.newBuilder().setUri('s3://b/offloaded/inputs.pb').setInputsHash('h').build()
+            createRun(_) >> created('r1')
+            getActionDataUris(_) >> uris('s3://b/r1/a0/inputs.pb')
         }
-        def run = new StandaloneRun(laptopConfig(), client, workDir)
+        def run = new StandaloneRun(laptopConfig(), runs, workDir)
         run.start()
 
         when:
         run.abort('Cancelled from Nextflow (SIGINT)')
 
         then:
-        1 * client.abortRun([org: 'acme', project: 'proj', domain: 'development', name: 'r1'], 'Cancelled from Nextflow (SIGINT)')
+        1 * runs.abortRun(runId('r1'), 'Cancelled from Nextflow (SIGINT)')
         run.statusFile.text == 'aborted'
     }
 
     def 'should still end the run when aborting it fails'() {
         given:
-        def client = Mock(FlyteClient) {
-            createRun(_) >> [action: [id: [run: [name: 'r1']]]]
-            getActionDataUris(_) >> [inputsUri: 's3://b/r1/a0/inputs.pb']
+        def runs = Mock(RunClient) {
+            uploadInputs(_) >> OffloadedInputData.newBuilder().setUri('s3://b/offloaded/inputs.pb').setInputsHash('h').build()
+            createRun(_) >> created('r1')
+            getActionDataUris(_) >> uris('s3://b/r1/a0/inputs.pb')
             abortRun(_, _) >> { throw new IOException('offline') }
         }
-        def run = new StandaloneRun(laptopConfig(), client, workDir)
+        def run = new StandaloneRun(laptopConfig(), runs, workDir)
         run.start()
 
         when:
@@ -119,10 +178,10 @@ class StandaloneRunTest extends Specification {
 
     def 'should derive the run storage prefix from the root input location'() {
         expect:
-        StandaloneRun.runOutputBase([inputsUri: 'gs://b/meta/r1/a0/inputs.pb']) == 'gs://b/meta/r1'
+        StandaloneRun.runOutputBase(uris('gs://b/meta/r1/a0/inputs.pb')) == 'gs://b/meta/r1'
 
         when:
-        StandaloneRun.runOutputBase([inputsUri: 's3://b/elsewhere/inputs.pb'])
+        StandaloneRun.runOutputBase(uris('s3://b/elsewhere/inputs.pb'))
 
         then:
         thrown(IllegalStateException)
@@ -130,9 +189,32 @@ class StandaloneRunTest extends Specification {
 
     // --- the root action's program, run with a local python against local files
 
-    Process watch(Path status, Path heartbeat, int timeout) {
-        new ProcessBuilder('python3', '-c', StandaloneRun.WATCHER, status.toString(), heartbeat.toString(), timeout.toString())
-            .redirectErrorStream(true).start()
+    Process watch(Path status, Path heartbeat, int timeout, Path outputs = null) {
+        def cmd = ['python3', '-c', StandaloneRun.WATCHER, status.toString(), heartbeat.toString(), timeout.toString()]
+        if( outputs )
+            cmd << outputs.toString()
+        new ProcessBuilder(cmd).redirectErrorStream(true).start()
+    }
+
+    def 'root should write empty outputs when the pipeline succeeds'() {
+        given:
+        def status = workDir.resolve('status')
+        status.text = result
+        def prefix = workDir.resolve('out/a0/0')
+
+        when:
+        def p = watch(status, workDir.resolve('heartbeat'), 300, prefix)
+        p.inputStream.text
+
+        then:
+        p.waitFor(20, TimeUnit.SECONDS)
+        Files.exists(prefix.resolve('outputs.pb')) == written
+        !written || prefix.resolve('outputs.pb').size() == 0
+
+        where:
+        result      | written
+        'succeeded' | true
+        'failed'    | false
     }
 
     def 'root should end with the pipeline result'() {

@@ -18,3 +18,12 @@ nextflowPlugin {
         'unionai.plugin.executor.FlyteExecutor',
     ]
 }
+
+dependencies {
+    implementation project(':controller')
+}
+
+// Nextflow provides slf4j: a second copy in the plugin would not reach its log
+configurations.runtimeClasspath {
+    exclude group: 'org.slf4j'
+}
