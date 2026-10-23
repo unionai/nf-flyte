@@ -104,15 +104,20 @@ class StandaloneRun {
     private final FlyteConfig config
     private final RunClient runs
     private final Path markerDir
+    private final String pipelineName
     private ScheduledExecutorService heartbeats
 
     @PackageScope String runName
     private RunIdentifier runId
 
-    StandaloneRun(FlyteConfig config, RunClient runs, Path workDir) {
+    /**
+     * @param pipelineName what the root's task is named after, e.g. `nf-core/rnaseq`
+     */
+    StandaloneRun(FlyteConfig config, RunClient runs, Path workDir, String pipelineName = null) {
         this.config = config
         this.runs = runs
         this.markerDir = workDir.resolve(".flyte/heads/${UUID.randomUUID()}")
+        this.pipelineName = pipelineName ?: 'nextflow'
     }
 
     Path getStatusFile() { markerDir.resolve('status') }
@@ -234,7 +239,7 @@ class StandaloneRun {
                 .setOrg(config.org)
                 .setProject(config.project)
                 .setDomain(config.domain)
-                .setName('nf.head')
+                .setName(taskName(pipelineName))
                 .setVersion(FlyteActionBuilder.TASK_VERSION))
             .setType('container')
             .setMetadata(TaskMetadata.newBuilder()
@@ -251,6 +256,14 @@ class StandaloneRun {
                     .addRequests(FlyteActionBuilder.resource(ResourceName.MEMORY, '256Mi'))
                     .addLimits(FlyteActionBuilder.resource(ResourceName.CPU, '500m'))
                     .addLimits(FlyteActionBuilder.resource(ResourceName.MEMORY, '512Mi'))))
-        return TaskSpec.newBuilder().setShortName('nextflow').setTaskTemplate(template).build()
+        return TaskSpec.newBuilder().setShortName(FlyteActionBuilder.truncate(pipelineName, 63)).setTaskTemplate(template).build()
+    }
+
+    /**
+     * Task name of the root, from the pipeline name, e.g. `nf-core/rnaseq` -> `nf.nf-core_rnaseq`.
+     * The UI shows the task's short name, which keeps the pipeline name as is.
+     */
+    static String taskName(String pipelineName) {
+        return FlyteActionBuilder.truncate('nf.' + pipelineName.replaceAll(/[^A-Za-z0-9_.-]/, '_'), 255)
     }
 }

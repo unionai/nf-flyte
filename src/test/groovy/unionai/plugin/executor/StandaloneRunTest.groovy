@@ -45,7 +45,7 @@ class StandaloneRunTest extends Specification {
         given:
         def config = laptopConfig()
         def runs = Mock(RunClient)
-        def run = new StandaloneRun(config, runs, workDir)
+        def run = new StandaloneRun(config, runs, workDir, 'nf-core/rnaseq')
         CreateRunRequest request
         UploadInputsRequest upload
 
@@ -69,6 +69,10 @@ class StandaloneRunTest extends Specification {
         request.runId.domain == 'development'
         def tmpl = request.taskSpec.taskTemplate
         tmpl.type == 'container'
+
+        and: 'the root is named after the pipeline'
+        request.taskSpec.shortName == 'nf-core/rnaseq'
+        tmpl.id.name == 'nf.nf-core_rnaseq'
         tmpl.metadata.runtime.type == RuntimeMetadata.RuntimeType.OTHER
         tmpl.metadata.runtime.flavor == 'nextflow'
         tmpl.metadata.runtime.version == '2.10.0'
@@ -94,6 +98,16 @@ class StandaloneRunTest extends Specification {
 
         cleanup:
         run.finish(true)
+    }
+
+    def 'should name the root nextflow without a pipeline name'() {
+        given:
+        def runs = Mock(RunClient)
+        def run = new StandaloneRun(laptopConfig(), runs, workDir)
+
+        expect:
+        run.rootSpec().shortName == 'nextflow'
+        run.rootSpec().taskTemplate.id.name == 'nf.nextflow'
     }
 
     def 'should use its own run name when a retried create finds the run'() {
