@@ -3,6 +3,8 @@ package unionai.flyte.controller
 import flyteidl2.common.Identifier.ActionIdentifier
 import flyteidl2.common.Identifier.RunIdentifier
 import flyteidl2.common.Run.OffloadedInputData
+import flyteidl2.dataproxy.DataproxyService.CreateUploadLocationRequest
+import flyteidl2.dataproxy.DataproxyService.CreateUploadLocationResponse
 import flyteidl2.dataproxy.DataproxyService.UploadInputsRequest
 import flyteidl2.workflow.RunDefinition.ActionDetails
 import flyteidl2.workflow.RunDefinition.Run
@@ -24,6 +26,12 @@ public interface RunClient {
      * it even when the run has no inputs: Flyte's UI reads them from there.
      */
     public fun uploadInputs(request: UploadInputsRequest): OffloadedInputData
+
+    /**
+     * A signed URL to upload a file to (`DataProxyService/CreateUploadLocation`), where the Flyte
+     * SDK uploads code bundles: Flyte's UI can download from there.
+     */
+    public fun createUploadLocation(request: CreateUploadLocationRequest): CreateUploadLocationResponse
 
     /**
      * Create a run under the request's run id.

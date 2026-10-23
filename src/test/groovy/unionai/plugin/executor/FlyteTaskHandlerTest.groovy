@@ -35,11 +35,13 @@ class FlyteTaskHandlerTest extends Specification {
     FlyteExecutor executor = Mock(FlyteExecutor)
     ActionController controller = Mock(ActionController)
     RunClient runs = Mock(RunClient)
+    CodeBundles codeBundles = Mock(CodeBundles) { upload(_) >> CompletableFuture.completedFuture('s3://fast/abc/code.tar.gz') }
     FlyteConfig flyteConfig = FlyteActionBuilderTest.config()
 
     def setup() {
         executor.getController() >> controller
         executor.getRuns() >> runs
+        executor.getCodeBundles() >> codeBundles
         executor.getFlyteConfig() >> { flyteConfig }
     }
 
@@ -373,6 +375,50 @@ class FlyteTaskHandlerTest extends Specification {
         then:
         0 * controller.submit({ named(it, 'nf-0123456789abcdef01234567') })
         h.@actionName == 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-0'
+    }
+
+    def 'should submit without waiting for the script upload, and enqueue once it is done'() {
+        given:
+        def upload = new CompletableFuture<String>()
+        def h = submittable()
+
+        when:
+        h.submit()
+
+        then:
+        1 * codeBundles.upload(workDir.resolve('.command.sh')) >> upload
+        0 * controller.submit(_)
+        h.status == TaskStatus.SUBMITTED
+        !h.checkIfRunning()
+
+        when:
+        upload.complete('s3://fast/abc/code.tar.gz')
+
+        then:
+        1 * controller.submit({ named(it, 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-0') }) >> done(Submitted.CREATED)
+        h.@codeBundleUri == 's3://fast/abc/code.tar.gz'
+    }
+
+    def 'should abort a task killed while its script uploads once it is enqueued'() {
+        given:
+        def upload = new CompletableFuture<String>()
+        def h = submittable()
+
+        when:
+        h.submit()
+        h.killTask()
+
+        then:
+        1 * codeBundles.upload(_) >> upload
+        0 * controller.submit(_)
+        0 * controller.abort(_, _)
+
+        when:
+        upload.complete(null)
+
+        then: 'without code view, the action is enqueued, then aborted'
+        1 * controller.submit(_) >> done(Submitted.CREATED)
+        1 * controller.abort('nf-a1b2c3d4e5f6a7b8c9d0e1f2-0', 'Killed by Nextflow') >> CompletableFuture.completedFuture(null)
     }
 
     def 'should abort a task killed while enqueuing once the enqueue is done'() {

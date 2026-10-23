@@ -53,6 +53,8 @@ class FlyteTaskHandler extends TaskHandler {
     /** The task's {@link #cacheKey()}, computed once on submit */
     @PackageScope String taskKey
     @PackageScope List<StagedInput> stagedInputs
+    /** The uploaded bundle of the task's script, for the action's Code tab (see {@link CodeBundles}) */
+    @PackageScope volatile String codeBundleUri
     /** The enqueue in flight, until {@link #enqueued()} has seen it complete */
     @PackageScope CompletableFuture<Submitted> submission
     private Map<String,BlobInput> inputs
@@ -104,11 +106,20 @@ class FlyteTaskHandler extends TaskHandler {
         synchronized( submitLock ) {
             if( killed )
                 return
-            // the enqueue completes in the background: the monitor moves on to the next task
-            submission = executor.controller.submit(newAction(inputs))
+            // the script's upload and then the enqueue complete in the background: the monitor
+            // moves on to the next task. A kill in between aborts the action once it's enqueued.
+            submission = executor.codeBundles.upload(task.workDir.resolve(TaskRun.CMD_SCRIPT)).thenCompose(this.&enqueue)
         }
         status = TaskStatus.SUBMITTED
         log.debug "[FLYTE] Process `${task.lazyName()}` submitted > action=$actionName; work-dir=${task.workDirStr}"
+    }
+
+    /**
+     * Enqueue the task's action, with the uploaded bundle of its script (null: no code view)
+     */
+    protected CompletableFuture<Submitted> enqueue(String codeBundleUri) {
+        this.codeBundleUri = codeBundleUri
+        return executor.controller.submit(newAction(inputs))
     }
 
     /**
@@ -253,6 +264,7 @@ class FlyteTaskHandler extends TaskHandler {
         builder.gpus = task.config.getAccelerator()?.request
         builder.time = task.config.getTime()
         builder.inputsUri = inputsUri
+        builder.codeBundleUri = codeBundleUri
         builder.inputs = inputs.collectEntries { name, input -> [name, input.dir] } as Map<String,Boolean>
         if( executor.flyteConfig.cache && task.processor.isCacheable() )
             builder.cacheKey = taskKey

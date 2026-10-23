@@ -121,6 +121,16 @@ class FlyteActionBuilderTest extends Specification {
         action.task.spec.taskTemplate.metadata.discoveryVersion == 'nf-flyte-1'
     }
 
+    def 'should point the Code tab at the code bundle'() {
+        given:
+        def b = builder()
+        b.codeBundleUri = 's3://b/work/ab/cdef/.flyte/code.tar.gz'
+
+        expect:
+        b.build().task.spec.taskTemplate.metadata.codeBundleUri == 's3://b/work/ab/cdef/.flyte/code.tar.gz'
+        builder().build().task.spec.taskTemplate.metadata.codeBundleUri == ''
+    }
+
     def 'should set the queue and omit empty settings'() {
         when:
         def action = builder(queue: 'gpu').build()
