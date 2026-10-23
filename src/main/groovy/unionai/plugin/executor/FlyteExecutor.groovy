@@ -5,6 +5,7 @@ import java.time.Duration
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
+import nextflow.Session
 import nextflow.exception.AbortOperationException
 import nextflow.exception.AbortSignalException
 import nextflow.executor.Executor
@@ -124,8 +125,18 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
      * Launched outside Flyte: create the run the task actions go into (see {@link StandaloneRun})
      */
     protected void startStandaloneRun() {
-        standaloneRun = new StandaloneRun(flyteConfig, connection.runs, getWorkDir())
+        standaloneRun = new StandaloneRun(flyteConfig, connection.runs, getWorkDir(), pipelineName(session))
         standaloneRun.start()
+    }
+
+    /**
+     * The pipeline's name: its manifest name (`nf-core/rnaseq`), else the project it was pulled
+     * from, else its main script without `.nf`.
+     */
+    static String pipelineName(Session session) {
+        return session.manifest?.name
+            ?: session.workflowMetadata?.projectName
+            ?: session.scriptName?.replaceFirst(/\.nf$/, '')
     }
 
     /**

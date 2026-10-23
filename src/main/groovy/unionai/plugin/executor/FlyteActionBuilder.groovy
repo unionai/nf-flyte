@@ -207,7 +207,7 @@ class FlyteActionBuilder {
         return 'nf.' + simple.replaceAll(/[^A-Za-z0-9_.-]/, '_')
     }
 
-    private static String truncate(String s, int max) {
+    static String truncate(String s, int max) {
         s && s.length() > max ? s.substring(0, max) : s
     }
 }

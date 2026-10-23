@@ -44,6 +44,8 @@ work, through Nextflow's `nf-amazon`, `nf-google` and `nf-azure` plugins.
 
 You can also run `nextflow run` on a laptop or in CI. The executor then creates the Flyte run
 itself and prints its URL. Its root action stands for the Nextflow head:
+- Its task is named after the pipeline: the manifest name (e.g. `nf-core/rnaseq`), else the
+  project it was pulled from, else the main script.
 - It ends with the pipeline's result. Stopping Nextflow (Ctrl+C, SIGTERM) aborts the run,
   which then shows as aborted rather than failed.
 - It fails if the head stops sending heartbeats (for example, a closed laptop or a killed CI
