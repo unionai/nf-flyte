@@ -4,7 +4,12 @@ plugins {
     id 'org.jetbrains.kotlin.jvm' version '2.4.21'
     id 'com.google.protobuf' version '0.10.0'
     id 'java-library'
+    id 'maven-publish'
+    id 'org.jetbrains.dokka-javadoc' version '2.1.0'
 }
+
+group = 'ai.union.flyte'
+version = rootProject.version
 
 def protobufVersion = '4.36.2'
 def connectVersion = '0.10.0'
@@ -14,6 +19,16 @@ repositories {
 }
 
 kotlin {
+    // every public declaration states that it is, and its type: the public API is deliberate
+    explicitApi()
+    // the public API, in api/controller.api: `./gradlew :controller:updateKotlinAbi` after changing it
+    abiValidation {
+        enabled = true
+        filters {
+            include { byNames.add('unionai.flyte.controller.**') }
+            exclude { byNames.add('unionai.flyte.controller.internal.**') }
+        }
+    }
     jvmToolchain(21)
     compilerOptions {
         // Nextflow runs on Java 17+
@@ -24,6 +39,7 @@ kotlin {
 
 java {
     toolchain { languageVersion = JavaLanguageVersion.of(21) }
+    withSourcesJar()
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -32,7 +48,7 @@ tasks.withType(JavaCompile).configureEach {
 
 dependencies {
     api "com.google.protobuf:protobuf-javalite:$protobufVersion"
-    api "com.connectrpc:connect-kotlin:$connectVersion"
+    implementation "com.connectrpc:connect-kotlin:$connectVersion"
     implementation "com.connectrpc:connect-kotlin-okhttp:$connectVersion"
     implementation "com.connectrpc:connect-kotlin-google-javalite-ext:$connectVersion"
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0'
@@ -80,6 +96,37 @@ protobuf {
             }
             plugins {
                 connectkotlin {}
+            }
+        }
+    }
+}
+
+// Javadoc of the public package only: not of the generated protos, nor the implementation
+dokka {
+    moduleName = 'Flyte controller'
+    dokkaSourceSets.configureEach {
+        includes.from('Module.md')
+        perPackageOption {
+            matchingRegex = '^(?!unionai\\.flyte\\.controller$).*'
+            suppress = true
+        }
+    }
+}
+
+def javadocJar = tasks.register('javadocJar', Jar) {
+    archiveClassifier = 'javadoc'
+    from tasks.named('dokkaGeneratePublicationJavadoc')
+}
+
+publishing {
+    publications {
+        controller(MavenPublication) {
+            artifactId = 'flyte-controller'
+            from components.java
+            artifact javadocJar
+            pom {
+                name = 'Flyte controller'
+                description = 'Runs Flyte v2 actions from the JVM, watching their state instead of polling'
             }
         }
     }

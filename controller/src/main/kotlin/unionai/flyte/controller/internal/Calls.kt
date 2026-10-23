@@ -1,4 +1,4 @@
-package unionai.flyte.controller
+package unionai.flyte.controller.internal
 
 import com.connectrpc.Code
 import com.connectrpc.ConnectException
@@ -7,6 +7,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
+import unionai.flyte.controller.FlyteException
 
 /** Exponential backoff: [minMillis] doubling per attempt, up to [maxMillis] */
 internal fun backoffMillis(attempt: Int, minMillis: Long, maxMillis: Long): Long =

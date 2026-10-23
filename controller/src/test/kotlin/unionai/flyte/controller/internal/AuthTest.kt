@@ -1,4 +1,4 @@
-package unionai.flyte.controller
+package unionai.flyte.controller.internal
 
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicInteger
@@ -13,6 +13,8 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
+import unionai.flyte.controller.FlyteException
+import unionai.flyte.controller.TokenSource
 
 class AuthTest {
 

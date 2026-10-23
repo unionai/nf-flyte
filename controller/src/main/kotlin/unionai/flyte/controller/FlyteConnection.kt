@@ -15,14 +15,33 @@ import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.Dispatchers
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import unionai.flyte.controller.internal.AuthInterceptor
+import unionai.flyte.controller.internal.AuthMetadata
+import unionai.flyte.controller.internal.Caller
+import unionai.flyte.controller.internal.ClientCredentialsTokenSource
+import unionai.flyte.controller.internal.CommandTokenSource
+import unionai.flyte.controller.internal.DefaultActionController
+import unionai.flyte.controller.internal.DefaultRunClient
+import unionai.flyte.controller.internal.RateLimiter
+import unionai.flyte.controller.internal.Retry
 
 /**
  * A connection to a Flyte v2 control plane, speaking Connect with binary protobuf over OkHttp.
+ * Open one per process and share it: its controllers and [runs] share its connections, token
+ * and rate limit.
  *
- * Every call carries the bearer token from [TokenSource]; the header it goes in comes from the
- * server's public client config (e.g. `flyte-authorization`).
+ * ```java
+ * try (FlyteConnection connection = FlyteConnection.builder("tenant.hosted.unionai.cloud")
+ *         .apiKey(System.getenv("FLYTE_API_KEY"))
+ *         .build()) {
+ *     ...
+ * }
+ * ```
+ *
+ * Every call carries a bearer token, in the header the server's public client config names
+ * (e.g. `flyte-authorization`). A call rejected with HTTP 401 is retried with a new token.
  */
-class FlyteConnection private constructor(
+public class FlyteConnection private constructor(
     baseUrl: String,
     makeTokens: (AuthMetadata, OkHttpClient) -> TokenSource,
     maxQps: Int,
@@ -62,16 +81,20 @@ class FlyteConnection private constructor(
 
     private val actions = ActionsServiceClient(protocol)
 
-    /** Run service calls, for creating and aborting runs */
-    val runs: RunClient = DefaultRunClient(RunServiceClient(protocol), DataProxyServiceClient(protocol), Caller(Retry.blocking()))
+    /** Run service calls, for creating and aborting runs, and reading actions' data */
+    public val runs: RunClient = DefaultRunClient(RunServiceClient(protocol), DataProxyServiceClient(protocol), Caller(Retry.blocking(), limiter))
 
     /**
-     * A controller for the child actions of [parentAction] in the given run. Call
-     * [ActionController.start] before using it.
+     * A controller for the child actions of [parentAction] in the given run, e.g. of `a0`, the
+     * run's root action. Call [ActionController.start] before using it, and close it when done.
      */
-    fun controller(runId: RunIdentifier, parentAction: String): ActionController =
+    public fun controller(runId: RunIdentifier, parentAction: String): ActionController =
         DefaultActionController(actions, runId, parentAction, tokens, Caller(Retry.actions(), limiter), Caller(Retry.blocking(), limiter))
 
+    /**
+     * Close the connection, ending the watch of any controller still open. Close controllers
+     * first, so they can wait for their pending aborts.
+     */
     override fun close() {
         // ends the calls still open, e.g. a watch whose controller wasn't closed
         http.dispatcher.cancelAll()
@@ -79,23 +102,65 @@ class FlyteConnection private constructor(
         http.connectionPool.evictAll()
     }
 
-    companion object {
+    /**
+     * Configures a [FlyteConnection]. Set one way to authenticate: [apiKey], [authCommand] or
+     * [tokenSource]; the last one set wins.
+     */
+    public class Builder internal constructor(endpoint: String) {
+
+        private val baseUrl = (if ("://" in endpoint) endpoint else "https://$endpoint").trimEnd('/')
+        private var tokens: ((AuthMetadata, OkHttpClient) -> TokenSource)? = null
+        private var maxQps = 100
+
+        /**
+         * Authenticate with a Flyte API key (see [ApiKey]), exchanged for access tokens with the
+         * OAuth2 client-credentials grant, as the Flyte SDK does.
+         *
+         * @throws FlyteException when the key is malformed
+         */
+        public fun apiKey(key: String): Builder = apply {
+            val decoded = ApiKey.decode(key)
+            tokens = { metadata, http -> ClientCredentialsTokenSource(decoded, metadata, http) }
+        }
+
+        /**
+         * Authenticate with the access token a shell command prints, as its last line of output,
+         * e.g. a CLI that logs you in. It's run again after 5 minutes, or when the token is
+         * rejected, and may take up to 5 minutes.
+         */
+        public fun authCommand(command: String): Builder = apply {
+            require(command.isNotBlank()) { "empty auth command" }
+            tokens = { _, _ -> CommandTokenSource(command) }
+        }
+
+        /** Authenticate with tokens from [tokens] */
+        public fun tokenSource(tokens: TokenSource): Builder = apply {
+            this.tokens = { _, _ -> tokens }
+        }
+
+        /** Most enqueue, abort and run calls a second, across the connection's controllers; 100 by default */
+        public fun maxQps(maxQps: Int): Builder = apply {
+            require(maxQps > 0) { "maxQps must be positive: $maxQps" }
+            this.maxQps = maxQps
+        }
+
+        /**
+         * @throws FlyteException when no way to authenticate was set
+         */
+        public fun build(): FlyteConnection {
+            val tokens = tokens ?: throw FlyteException("Set how to authenticate to Flyte: an API key, an auth command or a token source")
+            return FlyteConnection(baseUrl, tokens, maxQps)
+        }
+    }
+
+    public companion object {
         private const val UNARY_TIMEOUT_SECONDS = 15L
 
         /**
-         * @param endpoint host of the Flyte API, e.g. `tenant.hosted.unionai.cloud`, or a URL
-         * @param apiKey Flyte API key, used when there is no [authCommand]
-         * @param authCommand command that prints an access token
-         * @param maxQps most enqueue / abort / run calls a second
+         * @param endpoint host of the Flyte API, e.g. `tenant.hosted.unionai.cloud`, or its URL,
+         *      e.g. `http://localhost:8090` for a local cluster
          */
         @JvmStatic
-        @JvmOverloads
-        fun create(endpoint: String, apiKey: String?, authCommand: String?, maxQps: Int = 100): FlyteConnection {
-            val baseUrl = (if ("://" in endpoint) endpoint else "https://$endpoint").trimEnd('/')
-            return FlyteConnection(baseUrl, { metadata, http ->
-                if (!authCommand.isNullOrBlank()) CommandTokenSource(authCommand)
-                else ClientCredentialsTokenSource(ApiKey.decode(apiKey), metadata, http)
-            }, maxQps)
-        }
+        public fun builder(endpoint: String): Builder = Builder(endpoint)
     }
 }

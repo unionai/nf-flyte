@@ -1,11 +1,11 @@
-package unionai.flyte.controller
+package unionai.flyte.controller.internal
 
 import com.google.protobuf.MessageLite
+import com.squareup.moshi.Moshi
 import flyteidl2.auth.AuthService.GetOAuth2MetadataRequest
 import flyteidl2.auth.AuthService.GetOAuth2MetadataResponse
 import flyteidl2.auth.AuthService.GetPublicClientConfigRequest
 import flyteidl2.auth.AuthService.GetPublicClientConfigResponse
-import com.squareup.moshi.Moshi
 import java.io.File
 import java.io.IOException
 import java.net.URLEncoder
@@ -22,20 +22,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
-
-/**
- * Supplies the bearer token sent with every Flyte call.
- */
-interface TokenSource {
-    /** A valid token, fetching a new one when there is none or it expired */
-    fun token(): String
-
-    /**
-     * Drop the [rejected] token, unless another caller already replaced it: concurrent calls
-     * rejected with the same token then fetch a new one only once.
-     */
-    fun invalidate(rejected: String)
-}
+import unionai.flyte.controller.ApiKey
+import unionai.flyte.controller.FlyteException
+import unionai.flyte.controller.TokenSource
 
 /** Holds the current token and when it expires; callers synchronize on the token source. */
 internal class CachedToken {
@@ -55,33 +44,6 @@ internal class CachedToken {
         if (token == rejected) {
             token = null
             expiry = Instant.EPOCH
-        }
-    }
-}
-
-/**
- * A Flyte API key: base64("endpoint:client_id:client_secret:org"), as issued by the Flyte CLI.
- */
-class ApiKey(
-    val clientId: String,
-    val clientSecret: String,
-    val endpoint: String? = null,
-    val org: String? = null,
-) {
-    companion object {
-        @JvmStatic
-        fun decode(key: String?): ApiKey {
-            if (key.isNullOrBlank()) throw FlyteException("Missing Flyte API key")
-            // the endpoint may itself contain colons (e.g. dns:///host), so split from the right
-            val parts = String(Base64.getDecoder().decode(key.trim()), StandardCharsets.UTF_8).split(':')
-            if (parts.size < 4) throw FlyteException("Invalid Flyte API key: expected 'endpoint:client_id:client_secret:org'")
-            val org = parts[parts.size - 1]
-            return ApiKey(
-                clientId = parts[parts.size - 3],
-                clientSecret = parts[parts.size - 2],
-                endpoint = parts.subList(0, parts.size - 3).joinToString(":"),
-                org = org.takeIf { it.isNotEmpty() && it != "None" },
-            )
         }
     }
 }
@@ -178,7 +140,7 @@ internal class ClientCredentialsTokenSource(
  * Runs a command that prints an access token (e.g. a CLI that logs you in). The token's lifetime
  * isn't known, so it's reused for a conservative 5 minutes, or until the server rejects it.
  */
-class CommandTokenSource(private val command: String) : TokenSource {
+internal class CommandTokenSource(private val command: String) : TokenSource {
 
     private val cached = CachedToken()
 
