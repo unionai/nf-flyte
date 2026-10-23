@@ -2,7 +2,7 @@ plugins {
     id 'io.nextflow.nextflow-plugin' version '1.0.0-beta.15'
 }
 
-version = '0.2.0'
+version = '0.2.1'
 
 // Build and test against another Nextflow line with e.g. ./gradlew test -PnxfVersion=26.04.6
 def nxfVersion = findProperty('nxfVersion') ?: '25.10.0'
