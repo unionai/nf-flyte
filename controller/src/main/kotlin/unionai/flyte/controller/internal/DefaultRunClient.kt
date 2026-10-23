@@ -5,6 +5,8 @@ import flyteidl2.common.Identifier.ActionIdentifier
 import flyteidl2.common.Identifier.RunIdentifier
 import flyteidl2.common.Run.OffloadedInputData
 import flyteidl2.dataproxy.DataProxyServiceClientInterface
+import flyteidl2.dataproxy.DataproxyService.CreateUploadLocationRequest
+import flyteidl2.dataproxy.DataproxyService.CreateUploadLocationResponse
 import flyteidl2.dataproxy.DataproxyService.UploadInputsRequest
 import flyteidl2.workflow.RunDefinition.ActionDetails
 import flyteidl2.workflow.RunDefinition.Run
@@ -27,6 +29,10 @@ internal class DefaultRunClient(
 
     override fun uploadInputs(request: UploadInputsRequest): OffloadedInputData = runBlocking {
         caller.unary("UploadInputs") { dataProxy.uploadInputs(request) }.getOrThrow().offloadedInputData
+    }
+
+    override fun createUploadLocation(request: CreateUploadLocationRequest): CreateUploadLocationResponse = runBlocking {
+        caller.unary("CreateUploadLocation") { dataProxy.createUploadLocation(request) }.getOrThrow()
     }
 
     override fun createRun(request: CreateRunRequest): Run? = runBlocking {

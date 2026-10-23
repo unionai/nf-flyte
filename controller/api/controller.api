@@ -78,6 +78,7 @@ public class unionai/flyte/controller/FlyteException : java/lang/RuntimeExceptio
 public abstract interface class unionai/flyte/controller/RunClient {
 	public abstract fun abortRun (Lflyteidl2/common/Identifier$RunIdentifier;Ljava/lang/String;)V
 	public abstract fun createRun (Lflyteidl2/workflow/RunServiceOuterClass$CreateRunRequest;)Lflyteidl2/workflow/RunDefinition$Run;
+	public abstract fun createUploadLocation (Lflyteidl2/dataproxy/DataproxyService$CreateUploadLocationRequest;)Lflyteidl2/dataproxy/DataproxyService$CreateUploadLocationResponse;
 	public abstract fun getActionData (Lflyteidl2/common/Identifier$ActionIdentifier;)Lflyteidl2/workflow/RunServiceOuterClass$GetActionDataResponse;
 	public abstract fun getActionDataUris (Lflyteidl2/common/Identifier$ActionIdentifier;)Lflyteidl2/workflow/RunServiceOuterClass$GetActionDataURIsResponse;
 	public abstract fun getActionDetails (Lflyteidl2/common/Identifier$ActionIdentifier;)Lflyteidl2/workflow/RunDefinition$ActionDetails;

@@ -1,14 +1,19 @@
 package unionai.plugin.executor
 
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.nio.file.Path
 import java.util.concurrent.CompletableFuture
 
 import com.google.common.hash.HashCode
+import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
 import flyteidl2.actions.ActionsServiceOuterClass.Action
 import flyteidl2.common.Identifier.ActionIdentifier
 import flyteidl2.common.Phase.ActionPhase
 import flyteidl2.core.Execution.ExecutionError
+import flyteidl2.dataproxy.DataproxyService.CreateUploadLocationRequest
+import flyteidl2.dataproxy.DataproxyService.CreateUploadLocationResponse
 import flyteidl2.task.Common.Outputs
 import flyteidl2.workflow.RunDefinition.AbortInfo
 import flyteidl2.workflow.RunDefinition.ActionDetails
@@ -441,5 +446,90 @@ class FlyteTaskHandlerTest extends Specification {
         'terminated with exit code (3). Reason [Error]'            | 3
         'image pull backoff'                                       | null
         null                                                       | null
+    }
+
+    def 'should pack the task script as a tar.gz any tar reader extracts'() {
+        given:
+        def script = '#!/bin/bash -ue\nfastqc --threads 2 sample.fq.gz\n'.bytes
+        def bundle = workDir.resolve('code.tar.gz')
+        bundle.bytes = FlyteTaskHandler.codeBundle('.command.sh', script)
+        def out = Files.createDirectories(workDir.resolve('out'))
+
+        when:
+        def tar = new ProcessBuilder('tar', '-xzf', bundle.toString(), '-C', out.toString()).redirectErrorStream(true).start()
+        def log = tar.inputStream.text
+
+        then:
+        tar.waitFor() == 0
+        log == ''
+        out.toFile().list() as List == ['.command.sh']
+        out.resolve('.command.sh').bytes == script
+    }
+
+    def 'should upload the code bundle where dataproxy says, with the headers it asks for'() {
+        given:
+        workDir.resolve('.command.sh').text = '#!/bin/bash -ue\necho hello\n'
+        def received = [:]
+        def server = HttpServer.create(new InetSocketAddress('127.0.0.1', 0), 0)
+        server.createContext('/upload') { HttpExchange ex ->
+            received.method = ex.requestMethod
+            received.md5 = ex.requestHeaders.get('Content-MD5')
+            received.extra = ex.requestHeaders.getFirst('X-Amz-Meta-Test')
+            received.body = ex.requestBody.bytes
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+        server.start()
+        def h = handler(TaskStatus.NEW)
+        CreateUploadLocationRequest request
+
+        when:
+        def uri = h.storeCodeBundle()
+
+        then:
+        1 * runs.createUploadLocation(_) >> { args ->
+            request = args[0]
+            CreateUploadLocationResponse.newBuilder()
+                .setSignedUrl("http://127.0.0.1:${server.address.port}/upload")
+                .setNativeUrl('s3://fast/abc/code.tar.gz')
+                .putHeaders('X-Amz-Meta-Test', 'yes')
+                // as dataproxy sends them: the HTTP client must not set these twice, or at all
+                .putHeaders('Content-Length', '24')
+                .putHeaders('Content-MD5', Base64.encoder.encodeToString(args[0].contentMd5.toByteArray()))
+                .build()
+        }
+        uri == 's3://fast/abc/code.tar.gz'
+        request.project == 'proj'
+        request.domain == 'development'
+        request.org == 'acme'
+        request.filename == 'code.tar.gz'
+        request.addContentMd5Metadata
+        received.method == 'PUT'
+        received.extra == 'yes'
+        received.body == FlyteTaskHandler.codeBundle('.command.sh', workDir.resolve('.command.sh').bytes)
+        request.contentMd5.toByteArray() == MessageDigest.getInstance('MD5').digest(received.body as byte[])
+        received.md5 == [Base64.encoder.encodeToString(request.contentMd5.toByteArray())]
+        request.contentLength == (received.body as byte[]).length
+
+        cleanup:
+        server?.stop(0)
+    }
+
+    def 'should leave the action without code view when the upload fails'() {
+        given:
+        workDir.resolve('.command.sh').text = 'echo hello'
+        def h = handler(TaskStatus.NEW)
+
+        when:
+        def uri = h.storeCodeBundle()
+
+        then:
+        1 * runs.createUploadLocation(_) >> { throw new RuntimeException('PERMISSION_DENIED') }
+        uri == null
+    }
+
+    def 'should make the same bundle from the same script'() {
+        expect:
+        FlyteTaskHandler.codeBundle('.command.sh', 'echo hi'.bytes) == FlyteTaskHandler.codeBundle('.command.sh', 'echo hi'.bytes)
     }
 }

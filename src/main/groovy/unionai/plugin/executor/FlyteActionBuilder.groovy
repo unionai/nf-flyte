@@ -62,6 +62,8 @@ class FlyteActionBuilder {
     Map<String,Boolean> inputs = [:]
     /** When set, Flyte caches the task's result under this key */
     String cacheKey
+    /** `.tar.gz` with the task's script, which Flyte's UI shows in the action's Code tab */
+    String codeBundleUri
 
     FlyteActionBuilder(FlyteConfig config) {
         this.config = config
@@ -102,6 +104,8 @@ class FlyteActionBuilder {
             metadata.setDiscoverable(true)
             metadata.setDiscoveryVersion(CACHE_VERSION)
         }
+        if( codeBundleUri )
+            metadata.setCodeBundleUri(codeBundleUri)
 
         final inputVars = VariableMap.newBuilder()
         inputs.each { String name, Boolean dir -> inputVars.addVariables(variable(name, dir)) }
