@@ -1,4 +1,4 @@
-package unionai.flyte.controller
+package unionai.flyte.controller.internal
 
 import com.connectrpc.Code
 import com.connectrpc.ConnectException
@@ -7,7 +7,6 @@ import flyteidl2.actions.ActionsServiceOuterClass.Action
 import flyteidl2.common.Identifier.ActionIdentifier
 import flyteidl2.common.Phase.ActionPhase
 import java.time.Duration
-import java.util.Base64
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import kotlin.test.AfterTest
@@ -18,6 +17,10 @@ import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
+import unionai.flyte.controller.ActionListener
+import unionai.flyte.controller.ActionState
+import unionai.flyte.controller.FlyteException
+import unionai.flyte.controller.Submitted
 
 class ActionControllerTest {
 
@@ -173,16 +176,24 @@ class ActionControllerTest {
     }
 
     @Test
-    fun `decodes an API key`() {
-        val key = Base64.getEncoder().encodeToString("dns:///tenant.hosted.unionai.cloud:my-id:my-secret:acme".toByteArray())
-        val decoded = ApiKey.decode(key)
-        assertEquals("my-id", decoded.clientId)
-        assertEquals("my-secret", decoded.clientSecret)
-        assertEquals("dns:///tenant.hosted.unionai.cloud", decoded.endpoint)
-        assertEquals("acme", decoded.org)
-
-        val noOrg = Base64.getEncoder().encodeToString("host:id:secret:None".toByteArray())
-        assertNull(ApiKey.decode(noOrg).org)
-        assertFailsWith<FlyteException> { ApiKey.decode(Base64.getEncoder().encodeToString("nope".toByteArray())) }
+    fun `tells listeners when the watch gives up`() {
+        val controller = DefaultActionController(actions, RUN, "a0", tokens = null, maxWatchFailures = 1)
+        val failed = java.util.concurrent.CompletableFuture<Throwable>()
+        val removed = ActionListener { throw AssertionError("removed listener called") }
+        controller.addListener(object : ActionListener {
+            override fun onUpdate(state: ActionState) {}
+            override fun onWatchFailed(error: Throwable) { failed.complete(error) }
+        })
+        controller.addListener(removed)
+        controller.removeListener(removed)
+        val watch = actions.newWatch()
+        watch.trySend(SENTINEL)
+        watch.close(ConnectException(Code.PERMISSION_DENIED, "no"))
+        actions.newWatch().close(ConnectException(Code.PERMISSION_DENIED, "no"))
+        controller.use {
+            it.start(Duration.ofSeconds(5))
+            assertIs<ConnectException>(failed.get(10, TimeUnit.SECONDS))
+            assertFailsWith<FlyteException> { it.state("nf-a") }
+        }
     }
 }

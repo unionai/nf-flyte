@@ -1,191 +1,96 @@
 package unionai.flyte.controller
 
-import com.connectrpc.Code
-import com.connectrpc.Headers
-import com.connectrpc.ResponseMessage
-import flyteidl2.actions.ActionsServiceClientInterface
-import flyteidl2.actions.ActionsServiceOuterClass.AbortRequest
-import flyteidl2.actions.ActionsServiceOuterClass.AbortResponse
 import flyteidl2.actions.ActionsServiceOuterClass.Action
-import flyteidl2.actions.ActionsServiceOuterClass.EnqueueRequest
-import flyteidl2.common.Identifier.ActionIdentifier
 import flyteidl2.common.Identifier.RunIdentifier
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CopyOnWriteArrayList
-import kotlinx.coroutines.CoroutineName
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.future.asCompletableFuture
-import kotlinx.coroutines.future.future
-import kotlinx.coroutines.joinAll
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
-import org.slf4j.LoggerFactory
 
 /**
- * Runs actions under one parent action: enqueues them through the Actions service and knows their
- * state from its watch (see [Informer]), so reading it never calls Flyte.
+ * Runs the child actions of one parent action: enqueues them through the Actions service, and
+ * keeps their state in memory from the service's watch, so reading it never calls Flyte.
+ *
+ * Get one from [FlyteConnection.controller], add listeners, then [start] it:
+ * ```java
+ * try (ActionController controller = connection.controller(runId, "a0")) {
+ *     controller.addListener(state -> { if (state.isTerminal()) done.countDown(); });
+ *     controller.start(Duration.ofMinutes(2));
+ *     controller.submit(action).join();
+ *     // ... wait for the listener, then
+ *     ActionState state = controller.state("my-action");
+ * }
+ * ```
+ *
+ * All methods are thread-safe. The futures complete on the controller's threads: chain slow work
+ * with an `...Async` variant and your own executor.
  */
-interface ActionController : AutoCloseable {
+public interface ActionController : AutoCloseable {
 
-    val runId: RunIdentifier
+    /** The run the actions belong to */
+    public val runId: RunIdentifier
 
-    val parentAction: String
-
-    /**
-     * Start watching the parent's children and wait until the watch has listed the existing ones,
-     * so [state] knows about actions created before this controller.
-     */
-    fun start(timeout: Duration)
+    /** Name of the parent action, e.g. `a0` for the run's root */
+    public val parentAction: String
 
     /**
-     * Enqueue an action under the parent. Transient failures are retried.
+     * Start watching the parent's children, and wait until the watch has listed those that
+     * already exist, so that [state] also knows about actions created before this controller,
+     * e.g. by a previous attempt of the parent. Call it once.
      *
-     * @return [Submitted.EXISTS] when an action with that name already exists: it isn't replaced,
-     *      and [state] reports the existing one
+     * @throws FlyteException when the watch didn't list them within [timeout]
      */
-    fun submit(action: Action): CompletableFuture<Submitted>
+    public fun start(timeout: Duration)
 
     /**
-     * @return the last state the watch reported for the named action, or null when it hasn't
-     *      reported any yet, e.g. just after it was enqueued
-     * @throws FlyteException when the watch has failed for good
+     * Enqueue an action under the parent. Transient failures are retried for about 20 minutes,
+     * so a control plane restart doesn't fail the action. Its state then arrives through the
+     * watch, starting with [state] returning null until the service reports it.
+     *
+     * Names are the idempotency key: submitting a name again is safe, and doesn't replace or
+     * rerun the existing action. To rerun one, use a new name.
+     *
+     * @param action an action whose `parent_action_name` is [parentAction]
+     * @return a future of [Submitted.CREATED], or [Submitted.EXISTS] when an action with that
+     *      name already existed; it fails with [FlyteException] on a permanent error
      */
-    fun state(name: String): ActionState?
+    public fun submit(action: Action): CompletableFuture<Submitted>
 
     /**
-     * Abort the named action and its descendants. A missing or finished action is ignored.
+     * @param name the action's name, i.e. `action_id.name`
+     * @return the last state the watch reported for the action, or null when it reported none,
+     *      e.g. just after it was submitted, or before [start]
+     * @throws FlyteException when the watch has failed for good (see [ActionListener.onWatchFailed])
      */
-    fun abort(name: String, reason: String): CompletableFuture<Void?>
+    public fun state(name: String): ActionState?
 
-    /** Called for every state change of a child action */
-    fun addListener(listener: ActionListener)
+    /**
+     * Abort the named action, and with it its descendants. An action that is missing or already
+     * finished is left alone. Gives up after about 15 seconds of retries.
+     *
+     * @return a future completing once the service accepted the abort; the action's ABORTED
+     *      phase then arrives through the watch
+     */
+    public fun abort(name: String, reason: String): CompletableFuture<Void?>
 
-    /** Stop watching, after waiting briefly for pending aborts */
+    /**
+     * Notify [listener] of every change the watch reports. Add listeners before [start] to see
+     * the actions it lists first.
+     */
+    public fun addListener(listener: ActionListener)
+
+    public fun removeListener(listener: ActionListener)
+
+    /**
+     * Stop watching, after waiting up to 15 seconds for pending aborts. The actions keep
+     * running in Flyte. Doesn't close the [FlyteConnection].
+     */
     override fun close()
 }
 
-enum class Submitted { CREATED, EXISTS }
+/** What [ActionController.submit] did */
+public enum class Submitted {
+    /** Enqueued a new action */
+    CREATED,
 
-internal class DefaultActionController(
-    private val actions: ActionsServiceClientInterface,
-    override val runId: RunIdentifier,
-    override val parentAction: String,
-    private val tokens: TokenSource?,
-    private val enqueues: Caller = Caller(Retry.actions()),
-    private val aborts: Caller = Caller(Retry.blocking()),
-) : ActionController {
-
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineName("flyte-controller"))
-    private val listeners = CopyOnWriteArrayList<ActionListener>()
-    private val pendingAborts = CopyOnWriteArrayList<Deferred<Void?>>()
-
-    /** The Actions service routes every call by these headers, and rejects calls without them */
-    private val routing: Headers = mapOf(
-        "x-actions-project" to listOf(runId.project),
-        "x-actions-domain" to listOf(runId.domain),
-        "x-actions-run" to listOf(runId.name),
-        "x-actions-parent-action" to listOf(parentAction),
-    )
-
-    private val informer = Informer(
-        actions = actions,
-        parent = actionId(parentAction),
-        headers = routing,
-        tokens = tokens,
-        listener = ::notify,
-    )
-    private var watch: Job? = null
-
-    override fun start(timeout: Duration) {
-        check(watch == null) { "controller already started" }
-        watch = scope.launch(CoroutineName("flyte-watch-$parentAction")) { informer.run() }
-        runBlocking {
-            try {
-                withTimeout(timeout.toMillis()) { informer.awaitSynced() }
-            }
-            catch (e: TimeoutCancellationException) {
-                throw FlyteException("Timed out after ${timeout.seconds}s waiting for the Flyte watch of run ${runId.name}, action $parentAction", e)
-            }
-            catch (e: Exception) {
-                throw FlyteException("Unable to watch Flyte run ${runId.name}, action $parentAction: ${e.message}", e)
-            }
-        }
-        log.debug("[FLYTE] watching children of {}/{}: {} existing", runId.name, parentAction, informer.size)
-    }
-
-    override fun submit(action: Action): CompletableFuture<Submitted> {
-        require(action.parentActionName == parentAction) {
-            "action ${action.actionId.name} has parent ${action.parentActionName}, expected $parentAction"
-        }
-        val request = EnqueueRequest.newBuilder().setAction(action).build()
-        return scope.future {
-            val result = enqueues.unary("Enqueue ${action.actionId.name}", accept = setOf(Code.ALREADY_EXISTS)) {
-                actions.enqueue(request, routing)
-            }
-            if (result.isSuccess) Submitted.CREATED else Submitted.EXISTS
-        }
-    }
-
-    override fun state(name: String): ActionState? {
-        informer.failure?.let { throw FlyteException("The Flyte watch of run ${runId.name} failed: ${it.message}", it) }
-        return informer[name]
-    }
-
-    override fun abort(name: String, reason: String): CompletableFuture<Void?> {
-        if (informer[name]?.isTerminal == true)
-            return CompletableFuture.completedFuture(null)
-        val request = AbortRequest.newBuilder().setActionId(actionId(name)).setReason(reason).build()
-        val job = scope.async<Void?> {
-            aborts.unary("Abort $name", accept = setOf(Code.NOT_FOUND)) {
-                // the service rejects aborting a finished action with FAILED_PRECONDITION, which
-                // also means "wrong shard": retry it until the watch shows the action finished
-                if (informer[name]?.isTerminal == true) ResponseMessage.Success(AbortResponse.getDefaultInstance(), emptyMap(), emptyMap())
-                else actions.abort(request, routing)
-            }
-            null
-        }
-        pendingAborts.add(job)
-        job.invokeOnCompletion { pendingAborts.remove(job) }
-        return job.asCompletableFuture()
-    }
-
-    override fun addListener(listener: ActionListener) {
-        listeners.add(listener)
-    }
-
-    private fun notify(state: ActionState) {
-        for (l in listeners) {
-            try {
-                l.onUpdate(state)
-            }
-            catch (e: Exception) {
-                log.warn("[FLYTE] action listener failed on {}", state, e)
-            }
-        }
-    }
-
-    override fun close() {
-        runBlocking {
-            withTimeoutOrNull(ABORT_GRACE.toMillis()) { pendingAborts.toList().joinAll() }
-        }
-        scope.cancel()
-    }
-
-    private fun actionId(name: String): ActionIdentifier =
-        ActionIdentifier.newBuilder().setRun(runId).setName(name).build()
-
-    private companion object {
-        val log = LoggerFactory.getLogger(DefaultActionController::class.java)
-        val ABORT_GRACE: Duration = Duration.ofSeconds(15)
-    }
+    /** An action with that name already existed: it was left as it is */
+    EXISTS,
 }

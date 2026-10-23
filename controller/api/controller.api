@@ -1,0 +1,99 @@
+public abstract interface class unionai/flyte/controller/ActionController : java/lang/AutoCloseable {
+	public abstract fun abort (Ljava/lang/String;Ljava/lang/String;)Ljava/util/concurrent/CompletableFuture;
+	public abstract fun addListener (Lunionai/flyte/controller/ActionListener;)V
+	public abstract fun close ()V
+	public abstract fun getParentAction ()Ljava/lang/String;
+	public abstract fun getRunId ()Lflyteidl2/common/Identifier$RunIdentifier;
+	public abstract fun removeListener (Lunionai/flyte/controller/ActionListener;)V
+	public abstract fun start (Ljava/time/Duration;)V
+	public abstract fun state (Ljava/lang/String;)Lunionai/flyte/controller/ActionState;
+	public abstract fun submit (Lflyteidl2/actions/ActionsServiceOuterClass$Action;)Ljava/util/concurrent/CompletableFuture;
+}
+
+public abstract interface class unionai/flyte/controller/ActionListener {
+	public abstract fun onUpdate (Lunionai/flyte/controller/ActionState;)V
+	public fun onWatchFailed (Ljava/lang/Throwable;)V
+}
+
+public final class unionai/flyte/controller/ActionState {
+	public static final field Companion Lunionai/flyte/controller/ActionState$Companion;
+	public static final field TERMINAL Ljava/util/Set;
+	public fun <init> (Ljava/lang/String;Lflyteidl2/common/Phase$ActionPhase;Lflyteidl2/core/Execution$ExecutionError;Ljava/lang/String;)V
+	public fun equals (Ljava/lang/Object;)Z
+	public final fun getError ()Lflyteidl2/core/Execution$ExecutionError;
+	public final fun getName ()Ljava/lang/String;
+	public final fun getOutputUri ()Ljava/lang/String;
+	public final fun getPhase ()Lflyteidl2/common/Phase$ActionPhase;
+	public fun hashCode ()I
+	public final fun isStarted ()Z
+	public final fun isSucceeded ()Z
+	public final fun isTerminal ()Z
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class unionai/flyte/controller/ActionState$Companion {
+}
+
+public final class unionai/flyte/controller/ApiKey {
+	public static final field Companion Lunionai/flyte/controller/ApiKey$Companion;
+	public fun <init> (Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
+	public static final fun decode (Ljava/lang/String;)Lunionai/flyte/controller/ApiKey;
+	public final fun getClientId ()Ljava/lang/String;
+	public final fun getClientSecret ()Ljava/lang/String;
+	public final fun getEndpoint ()Ljava/lang/String;
+	public final fun getOrg ()Ljava/lang/String;
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class unionai/flyte/controller/ApiKey$Companion {
+	public final fun decode (Ljava/lang/String;)Lunionai/flyte/controller/ApiKey;
+}
+
+public final class unionai/flyte/controller/FlyteConnection : java/lang/AutoCloseable {
+	public static final field Companion Lunionai/flyte/controller/FlyteConnection$Companion;
+	public static final fun builder (Ljava/lang/String;)Lunionai/flyte/controller/FlyteConnection$Builder;
+	public fun close ()V
+	public final fun controller (Lflyteidl2/common/Identifier$RunIdentifier;Ljava/lang/String;)Lunionai/flyte/controller/ActionController;
+	public final fun getRuns ()Lunionai/flyte/controller/RunClient;
+}
+
+public final class unionai/flyte/controller/FlyteConnection$Builder {
+	public final fun apiKey (Ljava/lang/String;)Lunionai/flyte/controller/FlyteConnection$Builder;
+	public final fun authCommand (Ljava/lang/String;)Lunionai/flyte/controller/FlyteConnection$Builder;
+	public final fun build ()Lunionai/flyte/controller/FlyteConnection;
+	public final fun maxQps (I)Lunionai/flyte/controller/FlyteConnection$Builder;
+	public final fun tokenSource (Lunionai/flyte/controller/TokenSource;)Lunionai/flyte/controller/FlyteConnection$Builder;
+}
+
+public final class unionai/flyte/controller/FlyteConnection$Companion {
+	public final fun builder (Ljava/lang/String;)Lunionai/flyte/controller/FlyteConnection$Builder;
+}
+
+public class unionai/flyte/controller/FlyteException : java/lang/RuntimeException {
+	public fun <init> (Ljava/lang/String;)V
+	public fun <init> (Ljava/lang/String;Ljava/lang/Throwable;)V
+	public synthetic fun <init> (Ljava/lang/String;Ljava/lang/Throwable;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+}
+
+public abstract interface class unionai/flyte/controller/RunClient {
+	public abstract fun abortRun (Lflyteidl2/common/Identifier$RunIdentifier;Ljava/lang/String;)V
+	public abstract fun createRun (Lflyteidl2/workflow/RunServiceOuterClass$CreateRunRequest;)Lflyteidl2/workflow/RunDefinition$Run;
+	public abstract fun getActionData (Lflyteidl2/common/Identifier$ActionIdentifier;)Lflyteidl2/workflow/RunServiceOuterClass$GetActionDataResponse;
+	public abstract fun getActionDataUris (Lflyteidl2/common/Identifier$ActionIdentifier;)Lflyteidl2/workflow/RunServiceOuterClass$GetActionDataURIsResponse;
+	public abstract fun getActionDetails (Lflyteidl2/common/Identifier$ActionIdentifier;)Lflyteidl2/workflow/RunDefinition$ActionDetails;
+	public abstract fun uploadInputs (Lflyteidl2/dataproxy/DataproxyService$UploadInputsRequest;)Lflyteidl2/common/Run$OffloadedInputData;
+}
+
+public final class unionai/flyte/controller/Submitted : java/lang/Enum {
+	public static final field CREATED Lunionai/flyte/controller/Submitted;
+	public static final field EXISTS Lunionai/flyte/controller/Submitted;
+	public static fun getEntries ()Lkotlin/enums/EnumEntries;
+	public static fun valueOf (Ljava/lang/String;)Lunionai/flyte/controller/Submitted;
+	public static fun values ()[Lunionai/flyte/controller/Submitted;
+}
+
+public abstract interface class unionai/flyte/controller/TokenSource {
+	public fun invalidate (Ljava/lang/String;)V
+	public abstract fun token ()Ljava/lang/String;
+}
+

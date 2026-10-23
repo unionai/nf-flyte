@@ -16,6 +16,7 @@ import nextflow.processor.TaskRun
 import nextflow.util.ServiceName
 import org.pf4j.ExtensionPoint
 import unionai.flyte.controller.ActionController
+import unionai.flyte.controller.ActionListener
 import unionai.flyte.controller.ActionState
 import unionai.flyte.controller.FlyteConnection
 import unionai.flyte.controller.RunClient
@@ -115,7 +116,8 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
     }
 
     protected void createConnection() {
-        connection = FlyteConnection.create(flyteConfig.endpoint, flyteConfig.apiKey, flyteConfig.authCommand)
+        final builder = FlyteConnection.builder(flyteConfig.endpoint)
+        connection = (flyteConfig.authCommand ? builder.authCommand(flyteConfig.authCommand) : builder.apiKey(flyteConfig.apiKey)).build()
     }
 
     /**
@@ -131,13 +133,27 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
      */
     protected void startController() {
         controller = connection.controller(FlyteActionBuilder.runId(flyteConfig), flyteConfig.parentAction)
-        controller.addListener { ActionState state ->
-            // a task started or finished: let the monitor check it now, not at the next poll
-            final monitor = getMonitor()
-            if( state.started && monitor instanceof TaskPollingMonitor )
-                ((TaskPollingMonitor) monitor).signal()
-        }
+        controller.addListener(new ActionListener() {
+            @Override
+            void onUpdate(ActionState state) {
+                // a task started or finished: let the monitor check it now, not at the next poll
+                if( state.started )
+                    signalMonitor()
+            }
+
+            @Override
+            void onWatchFailed(Throwable error) {
+                // the tasks' next check fails with the error
+                signalMonitor()
+            }
+        })
         controller.start(WATCH_SYNC_TIMEOUT)
+    }
+
+    private void signalMonitor() {
+        final monitor = getMonitor()
+        if( monitor instanceof TaskPollingMonitor )
+            ((TaskPollingMonitor) monitor).signal()
     }
 
     @Override

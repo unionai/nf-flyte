@@ -126,7 +126,8 @@ with `cache false`, and all tasks with `flyte.cache = false`, are never cached.
 
 The Flyte client lives in the `controller` subproject (Kotlin, [connect-kotlin](https://github.com/connectrpc/connect-kotlin)):
 an informer over `ActionsService/WatchForUpdates` keeps every task action's state in memory, and
-the executor reads it from there. Its protobuf and Connect code is generated at build time from
+the executor reads it from there. It is a standalone library with a documented API for any JVM
+language: see [controller/README.md](controller/README.md). Its protobuf and Connect code is generated at build time from
 the flyteidl2 protos vendored in `controller/src/main/proto`; refresh them with
 `scripts/update-protos.sh <flyte tag>`. Building needs JDK 21.
 
