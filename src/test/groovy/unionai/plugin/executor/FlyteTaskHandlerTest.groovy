@@ -13,6 +13,7 @@ import flyteidl2.task.Common.Outputs
 import flyteidl2.workflow.RunDefinition.AbortInfo
 import flyteidl2.workflow.RunDefinition.ActionDetails
 import flyteidl2.workflow.RunServiceOuterClass.GetActionDataResponse
+import nextflow.Session
 import nextflow.exception.ProcessException
 import nextflow.processor.TaskProcessor
 import nextflow.processor.TaskRun
@@ -127,6 +128,34 @@ class FlyteTaskHandlerTest extends Specification {
         then:
         def e = thrown(ProcessException)
         e.message.contains('bad spec')
+    }
+
+    def 'should key the cache on the env and eval outputs a cached .command.env holds'() {
+        given:
+        executor.getCacheKeys() >> new FlyteCacheKey(workDir)
+        executor.getBinHash() >> ''
+        executor.getSession() >> Mock(Session) { getStubRun() >> false }
+        def key = { List<String> envs, Map<String,String> evals ->
+            def task = Mock(TaskRun) {
+                getProcessor() >> Mock(TaskProcessor) { getName() >> 'GUNZIP' }
+                getScript() >> 'gzip -cd x.gz > x'
+                getContainer() >> 'ubuntu'
+                getWorkDir() >> Files.createTempDirectory(workDir, 'task')
+                getInputFilesMap() >> [:]
+                getOutputEnvNames() >> envs
+                getOutputEvals() >> evals
+            }
+            new FlyteTaskHandler(task, executor).cacheKey()
+        }
+
+        expect: 'the same outputs, the same key'
+        key([], [nxf_out_eval_82: 'gzip --version']) == key([], [nxf_out_eval_82: 'gzip --version'])
+
+        and: 'renumbered by another pipeline revision or Nextflow version: a different key'
+        key([], [nxf_out_eval_82: 'gzip --version']) != key([], [nxf_out_eval_154: 'gzip --version'])
+        key([], [nxf_out_eval_82: 'gzip --version']) != key([], [nxf_out_eval_82: 'gzip -V'])
+        key(['FOO'], [:]) != key(['BAR'], [:])
+        key([], [:]) != key(['FOO'], [:])
     }
 
     def 'should name a cacheable task after its cache key and attempt, so a resumed task keeps its name'() {

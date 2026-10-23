@@ -283,6 +283,11 @@ class FlyteTaskHandler extends TaskHandler {
             task.script,
             task.container,
             env.toString(),
+            // the `env` and `eval` outputs a cached .command.env must hold: `eval` ones are named
+            // by a pipeline-wide counter (`nxf_out_eval_<n>`), which another pipeline revision or
+            // Nextflow version numbers differently
+            (task.outputEnvNames ?: Collections.<String>emptyList()).toString(),
+            new TreeMap<String,String>(task.outputEvals ?: Collections.<String,String>emptyMap()).toString(),
             executor.binHash,
             executor.session.stubRun ? 'stub-run' : '',
         ] as List<String>
