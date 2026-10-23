@@ -1,25 +1,13 @@
 package unionai.plugin.executor
 
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
-import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
-import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.zip.GZIPOutputStream
-
-import com.google.protobuf.ByteString
 
 import flyteidl2.actions.ActionsServiceOuterClass.Action
 import flyteidl2.common.Phase.ActionPhase
-import flyteidl2.dataproxy.DataproxyService.CreateUploadLocationRequest
-import flyteidl2.dataproxy.DataproxyService.CreateUploadLocationResponse
 import flyteidl2.task.Common.Outputs
 import groovy.transform.CompileStatic
 import groovy.transform.PackageScope
@@ -54,8 +42,6 @@ class FlyteTaskHandler extends TaskHandler {
      */
     static final String INPUTS_FILE = '.flyte/inputs.pb'
     static final String INPUTS_NAME = 'inputs.pb'
-    /** The task's script, as a `.tar.gz`: the code bundle Flyte's UI shows in the action's Code tab */
-    static final String CODE_BUNDLE_NAME = 'code.tar.gz'
 
 
     private final FlyteExecutor executor
@@ -67,7 +53,8 @@ class FlyteTaskHandler extends TaskHandler {
     /** The task's {@link #cacheKey()}, computed once on submit */
     @PackageScope String taskKey
     @PackageScope List<StagedInput> stagedInputs
-    @PackageScope String codeBundleUri
+    /** The uploaded bundle of the task's script, for the action's Code tab (see {@link CodeBundles}) */
+    @PackageScope volatile String codeBundleUri
     /** The enqueue in flight, until {@link #enqueued()} has seen it complete */
     @PackageScope CompletableFuture<Submitted> submission
     private Map<String,BlobInput> inputs
@@ -116,15 +103,23 @@ class FlyteTaskHandler extends TaskHandler {
         actionName = actionNameFor(task, taskKey)
         inputs = writeInputs()
         inputsUri = storeInputs(actionName)
-        codeBundleUri = storeCodeBundle()
         synchronized( submitLock ) {
             if( killed )
                 return
-            // the enqueue completes in the background: the monitor moves on to the next task
-            submission = executor.controller.submit(newAction(inputs))
+            // the script's upload and then the enqueue complete in the background: the monitor
+            // moves on to the next task. A kill in between aborts the action once it's enqueued.
+            submission = executor.codeBundles.upload(task.workDir.resolve(TaskRun.CMD_SCRIPT)).thenCompose(this.&enqueue)
         }
         status = TaskStatus.SUBMITTED
         log.debug "[FLYTE] Process `${task.lazyName()}` submitted > action=$actionName; work-dir=${task.workDirStr}"
+    }
+
+    /**
+     * Enqueue the task's action, with the uploaded bundle of its script (null: no code view)
+     */
+    protected CompletableFuture<Submitted> enqueue(String codeBundleUri) {
+        this.codeBundleUri = codeBundleUri
+        return executor.controller.submit(newAction(inputs))
     }
 
     /**
@@ -255,100 +250,6 @@ class FlyteTaskHandler extends TaskHandler {
         Files.createDirectories(target.parent)
         Files.write(target, inputsBytes)
         return FilesEx.toUriString(target)
-    }
-
-    /**
-     * Pack the task's script (`.command.sh`, as Nextflow rendered it) as the code bundle the UI
-     * shows, and upload it where the Flyte SDK uploads code bundles, which the UI can download
-     * from (a work dir bucket generally doesn't allow it: no CORS rule for the UI). The UI opens
-     * the bundle's first file, so it holds only the script.
-     *
-     * @return the bundle's URI, or null when it can't be uploaded: the action then has no code view
-     */
-    protected String storeCodeBundle() {
-        try {
-            final bundle = codeBundle(TaskRun.CMD_SCRIPT, Files.readAllBytes(task.workDir.resolve(TaskRun.CMD_SCRIPT)))
-            final md5 = MessageDigest.getInstance('MD5').digest(bundle)
-            final config = executor.flyteConfig
-            final location = executor.runs.createUploadLocation(CreateUploadLocationRequest.newBuilder()
-                .setOrg(config.org)
-                .setProject(config.project)
-                .setDomain(config.domain)
-                .setFilename(CODE_BUNDLE_NAME)
-                .setContentMd5(ByteString.copyFrom(md5))
-                .setAddContentMd5Metadata(true)
-                .setContentLength(bundle.length)
-                .build())
-            upload(location, bundle, md5)
-            return location.nativeUrl
-        }
-        catch( Exception e ) {
-            // once, not for every task: the tasks run anyway, without code view
-            if( CODE_BUNDLE_WARNED.compareAndSet(false, true) )
-                log.warn "Unable to upload task scripts for Flyte's UI, actions will show no code -- ${e.message}"
-            log.debug "[FLYTE] Unable to upload the code bundle of task ${task.lazyName()} | ${e.message}"
-            return null
-        }
-    }
-
-    private static final AtomicBoolean CODE_BUNDLE_WARNED = new AtomicBoolean()
-
-    private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
-
-    /**
-     * PUT the content to the signed URL, with the headers the Flyte SDK sends
-     */
-    static void upload(CreateUploadLocationResponse location, byte[] content, byte[] md5) {
-        final request = HttpRequest.newBuilder(URI.create(location.signedUrl))
-            .timeout(Duration.ofSeconds(60))
-            .header('Content-MD5', Base64.encoder.encodeToString(md5))
-            .PUT(HttpRequest.BodyPublishers.ofByteArray(content))
-        if( location.nativeUrl.startsWith('abfs') )
-            request.header('x-ms-blob-type', 'BlockBlob')
-        // the HTTP client sets Content-Length itself, from the body, and rejects it as a header
-        location.headersMap.each { String name, String value ->
-            if( !name.equalsIgnoreCase('Content-Length') )
-                request.setHeader(name, value)
-        }
-        final response = HTTP.send(request.build(), HttpResponse.BodyHandlers.ofString())
-        if( response.statusCode().intdiv(100) != 2 )
-            throw new IOException("Upload to ${location.nativeUrl} failed with HTTP ${response.statusCode()}: ${response.body()?.take(500)}")
-    }
-
-    /**
-     * @return a `.tar.gz` holding one file, readable by any tar reader (POSIX ustar)
-     */
-    static byte[] codeBundle(String name, byte[] content) {
-        final header = new byte[512]
-        final put = { int offset, int length, String value ->
-            final bytes = value.getBytes(StandardCharsets.US_ASCII)
-            System.arraycopy(bytes, 0, header, offset, Math.min(bytes.length, length))
-        }
-        put(0, 100, name)
-        put(100, 8, '0000644')
-        put(108, 8, '0000000')
-        put(116, 8, '0000000')
-        put(124, 12, String.format('%011o', content.length))
-        // no timestamp: the same script makes the same bundle, uploaded once
-        put(136, 12, '00000000000')
-        put(148, 8, '        ')
-        put(156, 1, '0')
-        put(257, 6, 'ustar')
-        put(263, 2, '00')
-        long sum = 0
-        for( byte b : header )
-            sum += (b & 0xff)
-        put(148, 8, String.format('%06o', sum) + '\u0000 ')
-
-        final bytes = new ByteArrayOutputStream()
-        new GZIPOutputStream(bytes).withCloseable { GZIPOutputStream gz ->
-            gz.write(header)
-            gz.write(content)
-            gz.write(new byte[(512 - content.length % 512) % 512])
-            // end of archive: two empty blocks
-            gz.write(new byte[1024])
-        }
-        return bytes.toByteArray()
     }
 
     protected Action newAction(Map<String,BlobInput> inputs) {

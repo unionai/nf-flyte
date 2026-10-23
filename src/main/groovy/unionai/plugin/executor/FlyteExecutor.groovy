@@ -48,6 +48,7 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
     private ActionController controller
     private Path remoteBinDir
     private FlyteCacheKey cacheKeys
+    private CodeBundles codeBundles
     private StandaloneRun standaloneRun
     private String binHash = ''
     /** Set once the run's storage proved unwritable: task inputs then go to their work dirs */
@@ -58,6 +59,7 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
     RunClient getRuns() { connection.runs }
     Path getRemoteBinDir() { remoteBinDir }
     FlyteCacheKey getCacheKeys() { cacheKeys }
+    CodeBundles getCodeBundles() { codeBundles }
     String getBinHash() { binHash }
 
     @Override
@@ -83,6 +85,7 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
         uploadBinDir()
         createConnection()
         cacheKeys = new FlyteCacheKey(getWorkDir())
+        codeBundles = new CodeBundles(connection.runs, flyteConfig)
         if( flyteConfig.standalone )
             startStandaloneRun()
         startController()
@@ -170,6 +173,7 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
             }
         }
         finally {
+            codeBundles?.close()
             // waits briefly for the aborts of killed tasks
             controller?.close()
             connection?.close()
