@@ -176,6 +176,25 @@ class StandaloneRunTest extends Specification {
         run.statusFile.text == 'aborted'
     }
 
+    def 'should still end the run when aborting it fails with an error'() {
+        given:
+        def runs = Mock(RunClient) {
+            uploadInputs(_) >> OffloadedInputData.newBuilder().setUri('s3://b/offloaded/inputs.pb').setInputsHash('h').build()
+            createRun(_) >> created('r1')
+            getActionDataUris(_) >> uris('s3://b/r1/a0/inputs.pb')
+            abortRun(_, _) >> { throw new NoClassDefFoundError('unionai/flyte/controller/internal/Missing') }
+        }
+        def run = new StandaloneRun(laptopConfig(), runs, workDir)
+        run.start()
+
+        when:
+        run.abort('Cancelled from Nextflow (SIGINT)')
+
+        then:
+        thrown(NoClassDefFoundError)
+        run.statusFile.text == 'aborted'
+    }
+
     def 'should derive the run storage prefix from the root input location'() {
         expect:
         StandaloneRun.runOutputBase(uris('gs://b/meta/r1/a0/inputs.pb')) == 'gs://b/meta/r1'

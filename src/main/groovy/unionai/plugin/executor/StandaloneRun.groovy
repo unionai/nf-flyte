@@ -180,7 +180,11 @@ class StandaloneRun {
         catch( Exception e ) {
             log.warn "Unable to abort Flyte run ${runName}, it will end as failed -- ${e.message}"
         }
-        Files.write(statusFile, ABORTED.getBytes(StandardCharsets.UTF_8))
+        finally {
+            // even on an Error (e.g. the plugin's jars replaced while it runs): the root still
+            // ends the run, without waiting for the heartbeat timeout
+            Files.write(statusFile, ABORTED.getBytes(StandardCharsets.UTF_8))
+        }
     }
 
     String url() {
