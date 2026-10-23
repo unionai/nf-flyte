@@ -25,6 +25,7 @@ import unionai.flyte.controller.RunClient
 import unionai.flyte.controller.Submitted
 import unionai.plugin.client.InputsProto
 import unionai.plugin.client.InputsProto.BlobInput
+import unionai.plugin.config.FlyteConfig
 
 class FlyteTaskHandlerTest extends Specification {
 
@@ -34,11 +35,12 @@ class FlyteTaskHandlerTest extends Specification {
     FlyteExecutor executor = Mock(FlyteExecutor)
     ActionController controller = Mock(ActionController)
     RunClient runs = Mock(RunClient)
+    FlyteConfig flyteConfig = FlyteActionBuilderTest.config()
 
     def setup() {
         executor.getController() >> controller
         executor.getRuns() >> runs
-        executor.getFlyteConfig() >> FlyteActionBuilderTest.config()
+        executor.getFlyteConfig() >> { flyteConfig }
     }
 
     static ActionState state(String phase, String outputUri = '', String error = null) {
@@ -147,6 +149,7 @@ class FlyteTaskHandlerTest extends Specification {
         def h = Spy(FlyteTaskHandler, constructorArgs: [task, executor])
         h.cacheKey() >> 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4'
         h.writeInputs() >> [:]
+        h.storeInputs(_) >> { String name -> "s3://bucket/base/$name/inputs.pb".toString() }
         h.newAction(_) >> { Action.newBuilder().setActionId(ActionIdentifier.newBuilder().setName(h.@actionName)).build() }
         return h
     }
@@ -357,9 +360,43 @@ class FlyteTaskHandlerTest extends Specification {
         1 * controller.abort('nf-abc', 'Killed by Nextflow') >> CompletableFuture.completedFuture(null)
     }
 
+    def 'should store inputs under the run, where Flyte keeps action data'() {
+        given:
+        def base = Files.createDirectories(workDir.resolve('run-base'))
+        def work = Files.createDirectories(workDir.resolve('ab/cdef'))
+        flyteConfig = FlyteActionBuilderTest.config(runOutputBase: base.toString() + '/')
+        def h = new FlyteTaskHandler(Mock(TaskRun) { getWorkDir() >> work }, executor)
+        h.@inputsBytes = [1, 2, 3] as byte[]
+
+        when:
+        def uri = h.storeInputs('nf-abc-0')
+
+        then:
+        uri == base.resolve('nf-abc-0/inputs.pb').toString()
+        base.resolve('nf-abc-0/inputs.pb').bytes == [1, 2, 3] as byte[]
+        !Files.exists(work.resolve(FlyteTaskHandler.INPUTS_FILE))
+    }
+
+    def 'should store inputs in the work dir when the run storage is not writable'() {
+        given: 'a run base below a regular file, so nothing can be written there'
+        def blocker = workDir.resolve('blocker')
+        blocker.text = 'x'
+        def work = Files.createDirectories(workDir.resolve('ab/cdef'))
+        flyteConfig = FlyteActionBuilderTest.config(runOutputBase: blocker.resolve('base').toString())
+        def h = new FlyteTaskHandler(Mock(TaskRun) { getWorkDir() >> work }, executor)
+        h.@inputsBytes = [4, 5] as byte[]
+
+        when:
+        h.storeInputs('nf-abc-0')
+
+        then:
+        work.resolve(FlyteTaskHandler.INPUTS_FILE).bytes == [4, 5] as byte[]
+    }
+
     def 'should name the inputs file the way the executor looks it up'() {
         expect: 'the executor reads <input_uri minus /inputs.pb>/inputs.pb, so any other name is never found'
         FlyteTaskHandler.INPUTS_FILE.endsWith('/inputs.pb')
+        FlyteTaskHandler.INPUTS_NAME == 'inputs.pb'
     }
 
     def 'should parse exit codes from Flyte errors'() {

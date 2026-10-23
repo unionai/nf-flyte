@@ -5,6 +5,7 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
 
 import flyteidl2.actions.ActionsServiceOuterClass.Action
 import flyteidl2.common.Phase.ActionPhase
@@ -41,6 +42,9 @@ class FlyteTaskHandler extends TaskHandler {
      * `/inputs.pb` and appends it again, so the file must have exactly that name.
      */
     static final String INPUTS_FILE = '.flyte/inputs.pb'
+    static final String INPUTS_NAME = 'inputs.pb'
+    /** Warn once when the run's storage can't be written, and inputs go to the work dir instead */
+    private static final AtomicBoolean INPUTS_FALLBACK_WARNED = new AtomicBoolean()
 
     private final FlyteExecutor executor
     private final Path outputFile
@@ -91,6 +95,7 @@ class FlyteTaskHandler extends TaskHandler {
         taskKey = cacheKey()
         actionName = actionNameFor(task, taskKey)
         inputs = writeInputs()
+        inputsUri = storeInputs(actionName)
         // the enqueue completes in the background: the monitor moves on to the next task
         submission = executor.controller.submit(newAction(inputs))
         status = TaskStatus.SUBMITTED
@@ -115,6 +120,7 @@ class FlyteTaskHandler extends TaskHandler {
             if( actionName != hashName ) {
                 log.debug "[FLYTE] Action $actionName was aborted by a previous attempt, running the task again"
                 actionName = hashName
+                inputsUri = storeInputs(actionName)
                 submission = executor.controller.submit(newAction(inputs))
                 return false
             }
@@ -156,7 +162,7 @@ class FlyteTaskHandler extends TaskHandler {
     }
 
     /**
-     * Write the action's `flyteidl2.task.Inputs` next to the task's other `.command.*` files.
+     * Encode the action's `flyteidl2.task.Inputs`; {@link #storeInputs} writes them.
      *
      * @return the inputs' locations, by name
      */
@@ -176,14 +182,42 @@ class FlyteTaskHandler extends TaskHandler {
             final bin = FlyteTaskLauncher.BIN_INPUT
             inputs.put(bin, new BlobInput(bin, FilesEx.toUriString(executor.remoteBinDir), true))
         }
-        final target = task.workDir.resolve(INPUTS_FILE)
-        Files.createDirectories(target.parent)
-        Files.write(target, InputsProto.encode(new ArrayList<BlobInput>(inputs.values())))
-        inputsUriCache = FilesEx.toUriString(target)
+        inputsBytes = InputsProto.encode(new ArrayList<BlobInput>(inputs.values()))
         return inputs
     }
 
-    private String inputsUriCache
+    private byte[] inputsBytes
+    @PackageScope String inputsUri
+
+    /**
+     * Store the encoded inputs where Flyte keeps the named action's data, under the run's
+     * storage (`<run base>/<action>/inputs.pb`), as the Flyte SDK does: Flyte's UI only shows
+     * inputs from there. When that isn't writable (e.g. the bucket is out of reach of the
+     * credentials Nextflow runs with), fall back to the task's work dir: the task still runs,
+     * the UI just doesn't show its inputs.
+     *
+     * @return the inputs' URI
+     */
+    protected String storeInputs(String name) {
+        final base = executor.flyteConfig.runOutputBase.replaceFirst(/\/+$/, '')
+        try {
+            final target = FileHelper.asPath("$base/$name/$INPUTS_NAME")
+            Files.createDirectories(target.parent)
+            Files.write(target, inputsBytes)
+            return FilesEx.toUriString(target)
+        }
+        catch( Exception e ) {
+            final msg = "Unable to write task inputs under the Flyte run's storage ($base), writing them to the work dir instead: Flyte's UI won't show task inputs -- ${e.message}"
+            if( INPUTS_FALLBACK_WARNED.compareAndSet(false, true) )
+                log.warn msg
+            else
+                log.debug "[FLYTE] $msg"
+        }
+        final target = task.workDir.resolve(INPUTS_FILE)
+        Files.createDirectories(target.parent)
+        Files.write(target, inputsBytes)
+        return FilesEx.toUriString(target)
+    }
 
     protected Action newAction(Map<String,BlobInput> inputs) {
         final builder = new FlyteActionBuilder(executor.flyteConfig)
@@ -196,7 +230,7 @@ class FlyteTaskHandler extends TaskHandler {
         builder.disk = task.config.getDisk()
         builder.gpus = task.config.getAccelerator()?.request
         builder.time = task.config.getTime()
-        builder.inputsUri = inputsUriCache
+        builder.inputsUri = inputsUri
         builder.inputs = inputs.collectEntries { name, input -> [name, input.dir] } as Map<String,Boolean>
         if( executor.flyteConfig.cache && task.processor.isCacheable() )
             builder.cacheKey = taskKey

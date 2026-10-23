@@ -99,8 +99,10 @@ Process directives map to the Flyte action like this:
 
 ### How a task runs
 
-1. The head renders Nextflow's usual task wrapper (`.command.run`), with the pod's paths, and
-   writes it and the task's `.flyte/inputs.pb` into the task dir.
+1. The head renders Nextflow's usual task wrapper (`.command.run`), with the pod's paths, into
+   the task dir, and writes the action's `inputs.pb` under the Flyte run's storage, where the
+   Flyte UI reads it. If the run's storage isn't writable, `inputs.pb` goes in the task dir
+   (`.flyte/inputs.pb`) instead: the task still runs, but the UI won't show its inputs.
 2. Flyte's copilot downloads every input file into the pod, keeping its name. The wrapper runs
    the task in a scratch dir, linking the inputs under their Nextflow stage names, and copies the
    declared outputs and the `.command.*` files to the directory copilot uploads.
