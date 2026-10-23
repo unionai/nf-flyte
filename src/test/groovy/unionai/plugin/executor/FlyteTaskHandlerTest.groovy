@@ -156,6 +156,19 @@ class FlyteTaskHandlerTest extends Specification {
         key([], [nxf_out_eval_82: 'gzip --version']) != key([], [nxf_out_eval_82: 'gzip -V'])
         key(['FOO'], [:]) != key(['BAR'], [:])
         key([], [:]) != key(['FOO'], [:])
+
+        and: 'commands containing what a flattened map would use as delimiters'
+        key([], [nxf_out_eval_1: 'echo a, nxf_out_eval_2=echo b', nxf_out_eval_2: 'echo c']) !=
+            key([], [nxf_out_eval_1: 'echo a', nxf_out_eval_2: 'echo b, nxf_out_eval_2=echo c'])
+        key(['A', 'B'], [:]) != key(['A, B'], [:])
+    }
+
+    def 'should encode maps and lists as unambiguous cache identity entries'() {
+        expect:
+        FlyteTaskHandler.entries([b: '2', a: '1']) == ['2', 'a', '1', 'b', '2']
+        FlyteTaskHandler.entries((Map<String,String>) null) == ['0']
+        FlyteTaskHandler.entries(['x', 'y']) == ['2', 'x', 'y']
+        FlyteTaskHandler.entries((List<String>) null) == ['0']
     }
 
     def 'should name a cacheable task after its cache key and attempt, so a resumed task keeps its name'() {
