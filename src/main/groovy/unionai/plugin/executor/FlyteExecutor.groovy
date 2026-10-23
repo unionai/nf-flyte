@@ -49,6 +49,8 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
     private FlyteCacheKey cacheKeys
     private StandaloneRun standaloneRun
     private String binHash = ''
+    /** Set once the run's storage proved unwritable: task inputs then go to their work dirs */
+    volatile boolean inputsInWorkDir
 
     FlyteConfig getFlyteConfig() { flyteConfig }
     ActionController getController() { controller }

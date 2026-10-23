@@ -341,6 +341,22 @@ class FlyteTaskHandlerTest extends Specification {
         1 * controller.abort('nf-abc', 'Killed by Nextflow') >> CompletableFuture.completedFuture(null)
     }
 
+    def 'should not run a killed task again'() {
+        given: 'a resumed task whose action a previous attempt aborted'
+        controller.submit(_) >> done(Submitted.EXISTS)
+        controller.state(_) >> state('ACTION_PHASE_ABORTED')
+        def h = submittable()
+        h.submit()
+
+        when: 'Nextflow kills it before the monitor sees the enqueue result'
+        h.killTask()
+        h.checkIfRunning()
+
+        then:
+        0 * controller.submit({ named(it, 'nf-0123456789abcdef01234567') })
+        h.@actionName == 'nf-a1b2c3d4e5f6a7b8c9d0e1f2-0'
+    }
+
     def 'should abort a task killed while enqueuing once the enqueue is done'() {
         given:
         def h = handler(TaskStatus.SUBMITTED)
@@ -360,37 +376,53 @@ class FlyteTaskHandlerTest extends Specification {
         1 * controller.abort('nf-abc', 'Killed by Nextflow') >> CompletableFuture.completedFuture(null)
     }
 
+    TaskRun hashedTask(Path work) {
+        Mock(TaskRun) {
+            getWorkDir() >> work
+            getHash() >> HashCode.fromString('0123456789abcdef0123456789abcdef')
+        }
+    }
+
     def 'should store inputs under the run, where Flyte keeps action data'() {
         given:
         def base = Files.createDirectories(workDir.resolve('run-base'))
         def work = Files.createDirectories(workDir.resolve('ab/cdef'))
         flyteConfig = FlyteActionBuilderTest.config(runOutputBase: base.toString() + '/')
-        def h = new FlyteTaskHandler(Mock(TaskRun) { getWorkDir() >> work }, executor)
+        def h = new FlyteTaskHandler(hashedTask(work), executor)
         h.@inputsBytes = [1, 2, 3] as byte[]
 
         when:
         def uri = h.storeInputs('nf-abc-0')
 
-        then:
-        uri == base.resolve('nf-abc-0/inputs.pb').toString()
-        base.resolve('nf-abc-0/inputs.pb').bytes == [1, 2, 3] as byte[]
+        then: 'in a directory of its own, so a resumed head attaching to the action keeps its inputs'
+        def stored = base.resolve('nf-abc-0/0123456789abcdef0123456789abcdef/inputs.pb')
+        uri == stored.toString()
+        stored.bytes == [1, 2, 3] as byte[]
         !Files.exists(work.resolve(FlyteTaskHandler.INPUTS_FILE))
     }
 
-    def 'should store inputs in the work dir when the run storage is not writable'() {
+    def 'should store inputs in the work dir once the run storage proved not writable'() {
         given: 'a run base below a regular file, so nothing can be written there'
         def blocker = workDir.resolve('blocker')
         blocker.text = 'x'
         def work = Files.createDirectories(workDir.resolve('ab/cdef'))
         flyteConfig = FlyteActionBuilderTest.config(runOutputBase: blocker.resolve('base').toString())
-        def h = new FlyteTaskHandler(Mock(TaskRun) { getWorkDir() >> work }, executor)
+        def h = new FlyteTaskHandler(hashedTask(work), executor)
         h.@inputsBytes = [4, 5] as byte[]
 
         when:
         h.storeInputs('nf-abc-0')
 
         then:
+        1 * executor.setInputsInWorkDir(true)
         work.resolve(FlyteTaskHandler.INPUTS_FILE).bytes == [4, 5] as byte[]
+
+        when: 'later tasks skip the run storage'
+        h.storeInputs('nf-def-0')
+
+        then:
+        _ * executor.isInputsInWorkDir() >> true
+        0 * executor.setInputsInWorkDir(_)
     }
 
     def 'should name the inputs file the way the executor looks it up'() {

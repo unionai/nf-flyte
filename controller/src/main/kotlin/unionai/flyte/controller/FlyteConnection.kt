@@ -30,7 +30,7 @@ class FlyteConnection private constructor(
 
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        // detects a dead connection under the long-lived watch, which is otherwise silent
+        // detects a dead connection, which the long-lived watch would otherwise wait on forever
         .pingInterval(30, TimeUnit.SECONDS)
         .dispatcher(Dispatcher().apply {
             maxRequests = 512
@@ -40,24 +40,21 @@ class FlyteConnection private constructor(
 
     private val metadata = AuthMetadata(baseUrl, http)
     private val tokens: TokenSource = makeTokens(metadata, http)
-    private val caller = Caller(
-        tokens = tokens,
-        limiter = RateLimiter(maxQps),
-        onStaleConnection = { http.connectionPool.evictAll() },
-    )
+    private val limiter = RateLimiter(maxQps)
 
     private val protocol: ProtocolClient = run {
-        val authed = http.newBuilder().addInterceptor(AuthInterceptor(tokens) { metadata.authorizationHeader() })
-        val unary = authed.readTimeout(UNARY_TIMEOUT_SECONDS, TimeUnit.SECONDS).build()
-        val stream = ConnectOkHttpClient.configureClient(authed).build()
+        // connect-kotlin's settings (no read timeouts, no silent retry of a 408) for both clients
+        fun connect() = ConnectOkHttpClient.configureClient(
+            http.newBuilder().addInterceptor(AuthInterceptor(tokens) { metadata.authorizationHeader() })
+        )
         ProtocolClient(
-            ConnectOkHttpClient(unary, stream),
+            ConnectOkHttpClient(connect().build(), connect().build()),
             ProtocolClientConfig(
                 host = baseUrl,
                 serializationStrategy = GoogleJavaLiteProtobufStrategy(),
                 networkProtocol = NetworkProtocol.CONNECT,
                 ioCoroutineContext = Dispatchers.IO,
-                // the watch stays open for as long as the pipeline runs
+                // unary calls time out; the watch stays open for as long as the pipeline runs
                 timeoutOracle = simpleTimeouts(UNARY_TIMEOUT_SECONDS.seconds, null),
             ),
         )
@@ -66,16 +63,18 @@ class FlyteConnection private constructor(
     private val actions = ActionsServiceClient(protocol)
 
     /** Run service calls, for creating and aborting runs */
-    val runs: RunClient = DefaultRunClient(RunServiceClient(protocol), DataProxyServiceClient(protocol), caller)
+    val runs: RunClient = DefaultRunClient(RunServiceClient(protocol), DataProxyServiceClient(protocol), Caller(Retry.blocking()))
 
     /**
      * A controller for the child actions of [parentAction] in the given run. Call
      * [ActionController.start] before using it.
      */
     fun controller(runId: RunIdentifier, parentAction: String): ActionController =
-        DefaultActionController(actions, runId, parentAction, tokens, caller)
+        DefaultActionController(actions, runId, parentAction, tokens, Caller(Retry.actions(), limiter), Caller(Retry.blocking(), limiter))
 
     override fun close() {
+        // ends the calls still open, e.g. a watch whose controller wasn't closed
+        http.dispatcher.cancelAll()
         http.dispatcher.executorService.shutdown()
         http.connectionPool.evictAll()
     }

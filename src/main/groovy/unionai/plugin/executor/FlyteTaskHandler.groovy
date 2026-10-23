@@ -5,7 +5,6 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
-import java.util.concurrent.atomic.AtomicBoolean
 
 import flyteidl2.actions.ActionsServiceOuterClass.Action
 import flyteidl2.common.Phase.ActionPhase
@@ -43,8 +42,7 @@ class FlyteTaskHandler extends TaskHandler {
      */
     static final String INPUTS_FILE = '.flyte/inputs.pb'
     static final String INPUTS_NAME = 'inputs.pb'
-    /** Warn once when the run's storage can't be written, and inputs go to the work dir instead */
-    private static final AtomicBoolean INPUTS_FALLBACK_WARNED = new AtomicBoolean()
+
 
     private final FlyteExecutor executor
     private final Path outputFile
@@ -59,6 +57,13 @@ class FlyteTaskHandler extends TaskHandler {
     @PackageScope CompletableFuture<Submitted> submission
     private Map<String,BlobInput> inputs
     private boolean enqueued
+    /**
+     * Guards {@link #actionName} and {@link #submission} where the poll thread replaces them (a
+     * resubmit) while another thread kills the task, and records the kill, after which nothing is
+     * submitted any more.
+     */
+    private final Object submitLock = new Object()
+    private boolean killed
 
     FlyteTaskHandler(TaskRun task, FlyteExecutor executor) {
         super(task)
@@ -96,8 +101,12 @@ class FlyteTaskHandler extends TaskHandler {
         actionName = actionNameFor(task, taskKey)
         inputs = writeInputs()
         inputsUri = storeInputs(actionName)
-        // the enqueue completes in the background: the monitor moves on to the next task
-        submission = executor.controller.submit(newAction(inputs))
+        synchronized( submitLock ) {
+            if( killed )
+                return
+            // the enqueue completes in the background: the monitor moves on to the next task
+            submission = executor.controller.submit(newAction(inputs))
+        }
         status = TaskStatus.SUBMITTED
         log.debug "[FLYTE] Process `${task.lazyName()}` submitted > action=$actionName; work-dir=${task.workDirStr}"
     }
@@ -113,21 +122,33 @@ class FlyteTaskHandler extends TaskHandler {
         if( !submission.isDone() )
             return false
         final result = submitted()
-        if( result == Submitted.EXISTS && phase() == ActionPhase.ACTION_PHASE_ABORTED ) {
-            // the failed head aborted this action when it shut down (Nextflow kills its running
-            // tasks on SIGTERM): run the task again, under its hash, which is new in this session
-            final hashName = FlyteActionBuilder.actionName(task.hash.toString())
-            if( actionName != hashName ) {
-                log.debug "[FLYTE] Action $actionName was aborted by a previous attempt, running the task again"
-                actionName = hashName
-                inputsUri = storeInputs(actionName)
-                submission = executor.controller.submit(newAction(inputs))
-                return false
-            }
-        }
+        if( result == Submitted.EXISTS && phase() == ActionPhase.ACTION_PHASE_ABORTED && resubmit() )
+            return false
         if( result == Submitted.EXISTS )
             log.debug "[FLYTE] Action $actionName already exists, attaching to it"
         enqueued = true
+        return true
+    }
+
+    /**
+     * The failed head aborted this action when it shut down (Nextflow kills its running tasks on
+     * SIGTERM): run the task again, under its hash, which is new in this session.
+     *
+     * @return whether the task was submitted again
+     */
+    private boolean resubmit() {
+        final hashName = FlyteActionBuilder.actionName(task.hash.toString())
+        if( actionName == hashName )
+            return false
+        log.debug "[FLYTE] Action $actionName was aborted by a previous attempt, running the task again"
+        final uri = storeInputs(hashName)
+        synchronized( submitLock ) {
+            if( killed )
+                return false
+            actionName = hashName
+            inputsUri = uri
+            submission = executor.controller.submit(newAction(inputs))
+        }
         return true
     }
 
@@ -191,27 +212,28 @@ class FlyteTaskHandler extends TaskHandler {
 
     /**
      * Store the encoded inputs where Flyte keeps the named action's data, under the run's
-     * storage (`<run base>/<action>/inputs.pb`), as the Flyte SDK does: Flyte's UI only shows
-     * inputs from there. When that isn't writable (e.g. the bucket is out of reach of the
-     * credentials Nextflow runs with), fall back to the task's work dir: the task still runs,
-     * the UI just doesn't show its inputs.
+     * storage, as the Flyte SDK does: Flyte's UI only shows inputs from there. The task hash in
+     * the path keeps a resumed head from overwriting the inputs of the action it attaches to.
+     *
+     * When the run's storage isn't writable (e.g. out of reach of the credentials Nextflow runs
+     * with), the inputs go to the task's work dir, for this and every later task: they still
+     * run, the UI just doesn't show their inputs.
      *
      * @return the inputs' URI
      */
     protected String storeInputs(String name) {
-        final base = executor.flyteConfig.runOutputBase.replaceFirst(/\/+$/, '')
-        try {
-            final target = FileHelper.asPath("$base/$name/$INPUTS_NAME")
-            Files.createDirectories(target.parent)
-            Files.write(target, inputsBytes)
-            return FilesEx.toUriString(target)
-        }
-        catch( Exception e ) {
-            final msg = "Unable to write task inputs under the Flyte run's storage ($base), writing them to the work dir instead: Flyte's UI won't show task inputs -- ${e.message}"
-            if( INPUTS_FALLBACK_WARNED.compareAndSet(false, true) )
-                log.warn msg
-            else
-                log.debug "[FLYTE] $msg"
+        if( !executor.inputsInWorkDir ) {
+            final base = executor.flyteConfig.runOutputBase.replaceFirst(/\/+$/, '')
+            try {
+                final target = FileHelper.asPath("$base/$name/${task.hash}/$INPUTS_NAME")
+                Files.createDirectories(target.parent)
+                Files.write(target, inputsBytes)
+                return FilesEx.toUriString(target)
+            }
+            catch( Exception e ) {
+                executor.inputsInWorkDir = true
+                log.warn "Unable to write task inputs under the Flyte run's storage ($base), writing them to the work dir instead: Flyte's UI won't show task inputs -- ${e.message}"
+            }
         }
         final target = task.workDir.resolve(INPUTS_FILE)
         Files.createDirectories(target.parent)
@@ -397,16 +419,21 @@ class FlyteTaskHandler extends TaskHandler {
 
     @Override
     protected void killTask() {
-        if( !actionName )
+        String name
+        CompletableFuture<Submitted> pending
+        synchronized( submitLock ) {
+            killed = true
+            name = actionName
+            pending = submission
+        }
+        if( !name || !pending )
             return
         // an enqueue still in flight would create the action after the abort: abort once it's done
-        final pending = submission && !submission.isDone() ? submission : CompletableFuture.completedFuture(null)
-        pending.handle { Object result, Throwable error -> abort(); return null }
+        pending.handle { Submitted result, Throwable error -> abort(name); return null }
     }
 
-    private void abort() {
-        // completes in the background; the executor waits for pending aborts when it shuts down
-        final name = actionName
+    private void abort(String name) {
+        // completes in the background; the executor waits briefly for pending aborts on shutdown
         executor.controller.abort(name, 'Killed by Nextflow').exceptionally { Throwable e ->
             log.debug "[FLYTE] Unable to abort action $name | ${e.message}"
             return null

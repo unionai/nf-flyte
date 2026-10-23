@@ -96,6 +96,27 @@ class StandaloneRunTest extends Specification {
         run.finish(true)
     }
 
+    def 'should use its own run name when a retried create finds the run'() {
+        given:
+        def config = laptopConfig()
+        def runs = Mock(RunClient) {
+            uploadInputs(_) >> OffloadedInputData.newBuilder().setUri('s3://b/offloaded/inputs.pb').setInputsHash('h').build()
+            createRun(_) >> null
+            getActionDataUris(_) >> { args -> uris("s3://b/${args[0].run.name}/a0/inputs.pb") }
+        }
+        def run = new StandaloneRun(config, runs, workDir)
+
+        when:
+        run.start()
+
+        then:
+        config.runName ==~ /nf[a-z0-9]{18}/
+        config.runOutputBase == "s3://b/${config.runName}"
+
+        cleanup:
+        run.finish(true)
+    }
+
     def 'should report how the pipeline ended'() {
         given:
         def runs = Mock(RunClient) {

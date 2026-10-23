@@ -3,30 +3,43 @@ package unionai.flyte.controller
 import com.connectrpc.Code
 import com.connectrpc.ConnectException
 import com.connectrpc.ResponseMessage
-import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
 
+/** Exponential backoff: [minMillis] doubling per attempt, up to [maxMillis] */
+internal fun backoffMillis(attempt: Int, minMillis: Long, maxMillis: Long): Long =
+    minOf(minMillis shl minOf(attempt - 1, 20), maxMillis)
+
 /**
- * Retry policy for unary calls, as in the Flyte SDK's controller: transient failures back off
- * exponentially up to [maxBackoffMillis], for up to [maxAttempts] attempts (about 20 minutes),
- * so a control plane rollout or a network blip doesn't fail a pipeline that has run for hours.
+ * Retry policy for unary calls: transient failures back off exponentially up to
+ * [maxBackoffMillis], for up to [maxAttempts] attempts.
+ *
+ * @param untilAvailable keep retrying RESOURCE_EXHAUSTED past [maxAttempts]: it only means the
+ *      service is shedding load
  */
 internal class Retry(
-    val maxAttempts: Int = 100,
+    val maxAttempts: Int,
     val minBackoffMillis: Long = 500,
     val maxBackoffMillis: Long = 10_000,
+    val untilAvailable: Boolean = false,
 ) {
-    fun backoffMillis(attempt: Int): Long =
-        minOf(minBackoffMillis shl minOf(attempt - 1, 20), maxBackoffMillis)
+    fun backoffMillis(attempt: Int): Long = backoffMillis(attempt, minBackoffMillis, maxBackoffMillis)
 
     companion object {
         /**
+         * For enqueue and abort, as in the Flyte SDK's controller: about 20 minutes, so a
+         * control plane rollout or a network blip doesn't fail a pipeline that has run for hours.
+         */
+        fun actions() = Retry(maxAttempts = 100, untilAvailable = true)
+
+        /** For calls someone waits on (startup, shutdown, a task's failure details): about 15s */
+        fun blocking() = Retry(maxAttempts = 5)
+
+        /**
          * Codes worth another try. FAILED_PRECONDITION is what the Actions service returns when a
-         * call reached the wrong shard, e.g. during a rebalance. RESOURCE_EXHAUSTED is retried
-         * without limit: it only means the service is shedding load.
+         * call reached the wrong shard, e.g. during a rebalance.
          */
         val RETRYABLE = setOf(
             Code.UNAVAILABLE,
@@ -60,21 +73,13 @@ internal class RateLimiter(perSecond: Int) {
 }
 
 /**
- * Makes unary calls with the [Retry] policy.
- *
- * @param tokens dropped when the server rejects one, so the retry authenticates again
- * @param onStaleConnection called after [STALE_AFTER] deadlines in a row: the calls may be riding
- *      a dead pooled connection (a severed NAT flow drops packets without a reset), which only
- *      a new connection gets around
+ * Makes unary calls with a [Retry] policy. A rejected token is replaced by the auth interceptor,
+ * which sees the call's HTTP 401, so a retried call authenticates again.
  */
 internal class Caller(
-    private val retry: Retry = Retry(),
-    private val tokens: TokenSource? = null,
+    private val retry: Retry,
     private val limiter: RateLimiter? = null,
-    private val onStaleConnection: () -> Unit = {},
 ) {
-    private val deadlines = AtomicInteger()
-
     /**
      * @return the response, or the failure when the call failed with one of [accept]
      */
@@ -87,26 +92,13 @@ internal class Caller(
         while (true) {
             attempt++
             limiter?.acquire()
-            val resp = call()
-            val code = (resp as? ResponseMessage.Failure)?.cause?.code
-            if (code == Code.DEADLINE_EXCEEDED) {
-                if (deadlines.incrementAndGet() >= STALE_AFTER) {
-                    deadlines.set(0)
-                    log.warn("[FLYTE] {} calls in a row timed out, dropping pooled connections", STALE_AFTER)
-                    onStaleConnection()
-                }
-            }
-            else {
-                deadlines.set(0)
-            }
-            when (resp) {
+            when (val resp = call()) {
                 is ResponseMessage.Success -> return Result.success(resp.message)
                 is ResponseMessage.Failure -> {
                     val cause = resp.cause
                     if (cause.code in accept) return Result.failure(cause)
-                    if (cause.code == Code.UNAUTHENTICATED) tokens?.invalidate()
                     val retryable = cause.code in Retry.RETRYABLE &&
-                        (attempt < retry.maxAttempts || cause.code == Code.RESOURCE_EXHAUSTED)
+                        (attempt < retry.maxAttempts || (retry.untilAvailable && cause.code == Code.RESOURCE_EXHAUSTED))
                     if (!retryable)
                         throw FlyteException("$method failed (${cause.code.codeName}): ${cause.message ?: cause.exception?.message}", cause)
                     log.debug("[FLYTE] {} failed ({}), retrying (attempt {})", method, cause.code.codeName, attempt)
@@ -117,7 +109,6 @@ internal class Caller(
     }
 
     private companion object {
-        const val STALE_AFTER = 3
         val log = LoggerFactory.getLogger(Caller::class.java)
     }
 }

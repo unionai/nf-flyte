@@ -5,6 +5,9 @@ import flyteidl2.auth.AuthService.GetOAuth2MetadataRequest
 import flyteidl2.auth.AuthService.GetOAuth2MetadataResponse
 import flyteidl2.auth.AuthService.GetPublicClientConfigRequest
 import flyteidl2.auth.AuthService.GetPublicClientConfigResponse
+import com.squareup.moshi.Moshi
+import java.io.File
+import java.io.IOException
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.time.Duration
@@ -18,7 +21,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import com.squareup.moshi.Moshi
 import org.slf4j.LoggerFactory
 
 /**
@@ -28,8 +30,33 @@ interface TokenSource {
     /** A valid token, fetching a new one when there is none or it expired */
     fun token(): String
 
-    /** Drop the current token, e.g. because the server rejected it */
-    fun invalidate()
+    /**
+     * Drop the [rejected] token, unless another caller already replaced it: concurrent calls
+     * rejected with the same token then fetch a new one only once.
+     */
+    fun invalidate(rejected: String)
+}
+
+/** Holds the current token and when it expires; callers synchronize on the token source. */
+internal class CachedToken {
+    var token: String? = null
+        private set
+    private var expiry: Instant = Instant.EPOCH
+
+    fun valid(): String? = token?.takeIf { Instant.now().isBefore(expiry) }
+
+    fun set(token: String, expiry: Instant): String {
+        this.token = token
+        this.expiry = expiry
+        return token
+    }
+
+    fun invalidate(rejected: String) {
+        if (token == rejected) {
+            token = null
+            expiry = Instant.EPOCH
+        }
+    }
 }
 
 /**
@@ -107,12 +134,11 @@ internal class ClientCredentialsTokenSource(
     private val http: OkHttpClient,
 ) : TokenSource {
 
-    private var token: String? = null
-    private var expiry: Instant = Instant.EPOCH
+    private val cached = CachedToken()
 
     @Synchronized
     override fun token(): String {
-        token?.let { if (Instant.now().isBefore(expiry)) return it }
+        cached.valid()?.let { return it }
         val form = FormBody.Builder()
             .add("grant_type", "client_credentials")
             .add("scope", "all")
@@ -130,19 +156,15 @@ internal class ClientCredentialsTokenSource(
             if (!resp.isSuccessful) throw FlyteException("Unable to get a Flyte access token -> HTTP ${resp.code}: $body")
             val json = JSON.fromJson(body) ?: emptyMap<String, Any?>()
             val expiresIn = (json["expires_in"] as? Number)?.toLong() ?: 3600
-            // refresh a minute early
-            expiry = Instant.now().plusSeconds(maxOf(expiresIn - 60, 30))
-            log.debug("[FLYTE] obtained access token, expires in {}s", expiresIn)
             val access = json["access_token"] as? String ?: throw FlyteException("Flyte token endpoint returned no access_token")
-            return access.also { token = it }
+            log.debug("[FLYTE] obtained access token, expires in {}s", expiresIn)
+            // refresh a minute early
+            return cached.set(access, Instant.now().plusSeconds(maxOf(expiresIn - 60, 30)))
         }
     }
 
     @Synchronized
-    override fun invalidate() {
-        token = null
-        expiry = Instant.EPOCH
-    }
+    override fun invalidate(rejected: String) = cached.invalidate(rejected)
 
     private fun enc(s: String) = URLEncoder.encode(s, StandardCharsets.UTF_8)
 
@@ -158,38 +180,47 @@ internal class ClientCredentialsTokenSource(
  */
 class CommandTokenSource(private val command: String) : TokenSource {
 
-    private var token: String? = null
-    private var expiry: Instant = Instant.EPOCH
+    private val cached = CachedToken()
 
     @Synchronized
     override fun token(): String {
-        token?.let { if (Instant.now().isBefore(expiry)) return it }
-        val proc = ProcessBuilder("bash", "-c", command).redirectError(ProcessBuilder.Redirect.INHERIT).start()
-        val out = proc.inputStream.bufferedReader().readText().trim()
-        if (!proc.waitFor(5, TimeUnit.MINUTES)) {
-            proc.destroyForcibly()
-            throw FlyteException("Flyte auth command timed out: $command")
+        cached.valid()?.let { return it }
+        // stdout goes to a file, so a command that never closes it can't outlast the timeout
+        val out = File.createTempFile("flyte-token", ".txt")
+        try {
+            val proc = ProcessBuilder("bash", "-c", command)
+                .redirectOutput(out)
+                .redirectError(ProcessBuilder.Redirect.INHERIT)
+                .start()
+            if (!proc.waitFor(TIMEOUT.toMinutes(), TimeUnit.MINUTES)) {
+                proc.destroyForcibly()
+                throw FlyteException("Flyte auth command timed out after ${TIMEOUT.toMinutes()} minutes: $command")
+            }
+            val text = out.readText().trim()
+            if (proc.exitValue() != 0 || text.isEmpty())
+                throw FlyteException("Flyte auth command failed (exit ${proc.exitValue()}): $command")
+            return cached.set(text.lines().last().trim(), Instant.now().plus(TTL))
         }
-        if (proc.exitValue() != 0 || out.isEmpty())
-            throw FlyteException("Flyte auth command failed (exit ${proc.exitValue()}): $command")
-        expiry = Instant.now().plus(TTL)
-        return out.lines().last().trim().also { token = it }
+        finally {
+            out.delete()
+        }
     }
 
     @Synchronized
-    override fun invalidate() {
-        token = null
-        expiry = Instant.EPOCH
-    }
+    override fun invalidate(rejected: String) = cached.invalidate(rejected)
 
     private companion object {
         val TTL: Duration = Duration.ofMinutes(5)
+        val TIMEOUT: Duration = Duration.ofMinutes(5)
     }
 }
 
 /**
  * Adds the bearer token to every call. A call rejected with HTTP 401 gets a fresh token and is
- * sent once more.
+ * sent once more, unless its body can only be sent once (a stream): its caller retries it.
+ *
+ * Failing to get a token is reported as an [IOException], like any other transport failure, so
+ * callers retry it; OkHttp would otherwise report the call as cancelled.
  */
 internal class AuthInterceptor(
     private val tokens: TokenSource,
@@ -197,11 +228,25 @@ internal class AuthInterceptor(
 ) : Interceptor {
 
     override fun intercept(chain: Interceptor.Chain): Response {
-        val name = header()
-        val resp = chain.proceed(chain.request().newBuilder().header(name, "Bearer ${tokens.token()}").build())
+        val name = authenticated { header() }
+        val token = authenticated { tokens.token() }
+        val resp = chain.proceed(chain.request().newBuilder().header(name, "Bearer $token").build())
         if (resp.code != 401) return resp
+        tokens.invalidate(token)
+        if (chain.request().body?.isOneShot() == true) return resp
         resp.close()
-        tokens.invalidate()
-        return chain.proceed(chain.request().newBuilder().header(name, "Bearer ${tokens.token()}").build())
+        val fresh = authenticated { tokens.token() }
+        return chain.proceed(chain.request().newBuilder().header(name, "Bearer $fresh").build())
     }
+
+    private fun <T> authenticated(get: () -> T): T =
+        try {
+            get()
+        }
+        catch (e: IOException) {
+            throw e
+        }
+        catch (e: Exception) {
+            throw IOException("Unable to authenticate to Flyte: ${e.message}", e)
+        }
 }

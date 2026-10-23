@@ -15,7 +15,6 @@ import flyteidl2.core.Interface.TypedInterface
 import flyteidl2.core.Literals.RetryStrategy
 import flyteidl2.core.Tasks.Container
 import flyteidl2.core.Tasks.Resources
-import flyteidl2.core.Tasks.Resources.ResourceEntry
 import flyteidl2.core.Tasks.Resources.ResourceName
 import flyteidl2.core.Tasks.RuntimeMetadata
 import flyteidl2.core.Tasks.TaskMetadata
@@ -142,7 +141,8 @@ class StandaloneRun {
             .setTaskSpec(spec)
             .setOffloadedInputData(inputs)
             .build())
-        runId = run.action.id.run
+        // null when a retried CreateRun found the run its first attempt created
+        runId = run ? run.action.id.run : id
         runName = runId.name
         config.runName = runName
         config.parentAction = HEAD_ACTION
@@ -243,14 +243,10 @@ class StandaloneRun {
                 .setImage(config.rootImage)
                 .addAllCommand(['python', '-c', WATCHER, FilesEx.toUriString(statusFile), FilesEx.toUriString(heartbeatFile), config.heartbeatTimeout.toSeconds().toString(), OUTPUT_PREFIX])
                 .setResources(Resources.newBuilder()
-                    .addRequests(resource(ResourceName.CPU, '100m'))
-                    .addRequests(resource(ResourceName.MEMORY, '256Mi'))
-                    .addLimits(resource(ResourceName.CPU, '500m'))
-                    .addLimits(resource(ResourceName.MEMORY, '512Mi'))))
+                    .addRequests(FlyteActionBuilder.resource(ResourceName.CPU, '100m'))
+                    .addRequests(FlyteActionBuilder.resource(ResourceName.MEMORY, '256Mi'))
+                    .addLimits(FlyteActionBuilder.resource(ResourceName.CPU, '500m'))
+                    .addLimits(FlyteActionBuilder.resource(ResourceName.MEMORY, '512Mi'))))
         return TaskSpec.newBuilder().setShortName('nextflow').setTaskTemplate(template).build()
-    }
-
-    private static ResourceEntry resource(ResourceName name, String value) {
-        ResourceEntry.newBuilder().setName(name).setValue(value).build()
     }
 }

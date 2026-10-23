@@ -166,7 +166,7 @@ class FlyteActionBuilder {
         return result
     }
 
-    private static ResourceEntry resource(ResourceName name, String value) {
+    static ResourceEntry resource(ResourceName name, String value) {
         ResourceEntry.newBuilder().setName(name).setValue(value).build()
     }
 

@@ -23,7 +23,9 @@ class ActionControllerTest {
 
     private val actions = FakeActions()
     private val controller = DefaultActionController(
-        actions, RUN, "a0", tokens = null, caller = Caller(Retry(maxAttempts = 3, minBackoffMillis = 1, maxBackoffMillis = 1)),
+        actions, RUN, "a0", tokens = null,
+        enqueues = Caller(Retry(maxAttempts = 3, minBackoffMillis = 1, maxBackoffMillis = 1)),
+        aborts = Caller(Retry(maxAttempts = 3, minBackoffMillis = 1, maxBackoffMillis = 1)),
     )
 
     @AfterTest
@@ -134,17 +136,40 @@ class ActionControllerTest {
     }
 
     @Test
-    fun `drops pooled connections after repeated deadlines`() = runBlocking {
-        var stale = 0
-        val caller = Caller(Retry(maxAttempts = 5, minBackoffMillis = 1, maxBackoffMillis = 1), onStaleConnection = { stale++ })
+    fun `retries an abort that reached the wrong shard`() {
+        started()
+        actions.abortResults.add(Code.FAILED_PRECONDITION)
+        controller.abort("nf-running", "killed").get(5, TimeUnit.SECONDS)
+        assertEquals(2, actions.aborted.size)
+    }
+
+    @Test
+    fun `stops retrying an abort once the action finished`() {
+        val watch = actions.newWatch()
+        watch.trySend(SENTINEL)
+        controller.start(Duration.ofSeconds(5))
+        // the action finished before the abort reached it: the service keeps answering FAILED_PRECONDITION
+        actions.abortResults.add(Code.FAILED_PRECONDITION)
+        watch.trySend(update("nf-a", ActionPhase.ACTION_PHASE_SUCCEEDED))
+        while (controller.state("nf-a") == null) Thread.sleep(1)
+
+        controller.abort("nf-a", "killed").get(5, TimeUnit.SECONDS)
+        assertTrue(actions.aborted.size <= 1)
+    }
+
+    @Test
+    fun `keeps retrying an overloaded service only when asked to`() = runBlocking {
         var calls = 0
-        val result = caller.unary("Test") {
+        val busy: suspend () -> ResponseMessage<String> = {
             calls++
-            if (calls <= 3) ResponseMessage.Failure(ConnectException(Code.DEADLINE_EXCEEDED), emptyMap(), emptyMap())
+            if (calls <= 4) ResponseMessage.Failure(ConnectException(Code.RESOURCE_EXHAUSTED), emptyMap(), emptyMap())
             else ResponseMessage.Success("ok", emptyMap(), emptyMap())
         }
-        assertEquals("ok", result.getOrThrow())
-        assertEquals(1, stale)
+        assertEquals("ok", Caller(Retry(maxAttempts = 2, minBackoffMillis = 1, untilAvailable = true)).unary("Test", call = busy).getOrThrow())
+
+        calls = 0
+        assertFailsWith<FlyteException> { Caller(Retry(maxAttempts = 2, minBackoffMillis = 1)).unary("Test", call = busy) }
+        assertEquals(2, calls)
     }
 
     @Test

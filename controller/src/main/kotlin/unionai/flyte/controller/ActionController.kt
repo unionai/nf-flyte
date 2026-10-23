@@ -2,8 +2,10 @@ package unionai.flyte.controller
 
 import com.connectrpc.Code
 import com.connectrpc.Headers
+import com.connectrpc.ResponseMessage
 import flyteidl2.actions.ActionsServiceClientInterface
 import flyteidl2.actions.ActionsServiceOuterClass.AbortRequest
+import flyteidl2.actions.ActionsServiceOuterClass.AbortResponse
 import flyteidl2.actions.ActionsServiceOuterClass.Action
 import flyteidl2.actions.ActionsServiceOuterClass.EnqueueRequest
 import flyteidl2.common.Identifier.ActionIdentifier
@@ -79,12 +81,13 @@ internal class DefaultActionController(
     override val runId: RunIdentifier,
     override val parentAction: String,
     private val tokens: TokenSource?,
-    private val caller: Caller = Caller(tokens = tokens),
+    private val enqueues: Caller = Caller(Retry.actions()),
+    private val aborts: Caller = Caller(Retry.blocking()),
 ) : ActionController {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineName("flyte-controller"))
     private val listeners = CopyOnWriteArrayList<ActionListener>()
-    private val aborts = CopyOnWriteArrayList<Deferred<Void?>>()
+    private val pendingAborts = CopyOnWriteArrayList<Deferred<Void?>>()
 
     /** The Actions service routes every call by these headers, and rejects calls without them */
     private val routing: Headers = mapOf(
@@ -126,7 +129,7 @@ internal class DefaultActionController(
         }
         val request = EnqueueRequest.newBuilder().setAction(action).build()
         return scope.future {
-            val result = caller.unary("Enqueue ${action.actionId.name}", accept = setOf(Code.ALREADY_EXISTS)) {
+            val result = enqueues.unary("Enqueue ${action.actionId.name}", accept = setOf(Code.ALREADY_EXISTS)) {
                 actions.enqueue(request, routing)
             }
             if (result.isSuccess) Submitted.CREATED else Submitted.EXISTS
@@ -143,12 +146,16 @@ internal class DefaultActionController(
             return CompletableFuture.completedFuture(null)
         val request = AbortRequest.newBuilder().setActionId(actionId(name)).setReason(reason).build()
         val job = scope.async<Void?> {
-            // not found, or already terminal
-            caller.unary("Abort $name", accept = setOf(Code.NOT_FOUND, Code.FAILED_PRECONDITION)) { actions.abort(request, routing) }
+            aborts.unary("Abort $name", accept = setOf(Code.NOT_FOUND)) {
+                // the service rejects aborting a finished action with FAILED_PRECONDITION, which
+                // also means "wrong shard": retry it until the watch shows the action finished
+                if (informer[name]?.isTerminal == true) ResponseMessage.Success(AbortResponse.getDefaultInstance(), emptyMap(), emptyMap())
+                else actions.abort(request, routing)
+            }
             null
         }
-        aborts.add(job)
-        job.invokeOnCompletion { aborts.remove(job) }
+        pendingAborts.add(job)
+        job.invokeOnCompletion { pendingAborts.remove(job) }
         return job.asCompletableFuture()
     }
 
@@ -169,7 +176,7 @@ internal class DefaultActionController(
 
     override fun close() {
         runBlocking {
-            withTimeoutOrNull(ABORT_GRACE.toMillis()) { aborts.toList().joinAll() }
+            withTimeoutOrNull(ABORT_GRACE.toMillis()) { pendingAborts.toList().joinAll() }
         }
         scope.cancel()
     }

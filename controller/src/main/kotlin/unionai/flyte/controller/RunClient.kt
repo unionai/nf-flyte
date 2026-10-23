@@ -20,14 +20,21 @@ import kotlinx.coroutines.runBlocking
 
 /**
  * The few Run service calls the controller doesn't cover: creating and aborting a run, and
- * reading an action's details. They block the calling thread.
+ * reading an action's details. They block the calling thread, so they give up after a few
+ * seconds of retries.
  */
 interface RunClient {
 
     /** Store a run's inputs (`DataProxyService/UploadInputs`), for [createRun] to reference */
     fun uploadInputs(request: UploadInputsRequest): OffloadedInputData
 
-    fun createRun(request: CreateRunRequest): Run
+    /**
+     * Create a run under the request's run id.
+     *
+     * @return the run, or null when it already exists: a retried call whose first attempt
+     *      created it, since the caller names the run
+     */
+    fun createRun(request: CreateRunRequest): Run?
 
     /** Abort the run: it and all its actions end ABORTED */
     fun abortRun(runId: RunIdentifier, reason: String)
@@ -52,8 +59,8 @@ internal class DefaultRunClient(
         caller.unary("UploadInputs") { dataProxy.uploadInputs(request) }.getOrThrow().offloadedInputData
     }
 
-    override fun createRun(request: CreateRunRequest): Run = runBlocking {
-        caller.unary("CreateRun") { runs.createRun(request) }.getOrThrow().run
+    override fun createRun(request: CreateRunRequest): Run? = runBlocking {
+        caller.unary("CreateRun", accept = setOf(Code.ALREADY_EXISTS)) { runs.createRun(request) }.getOrNull()?.run
     }
 
     override fun abortRun(runId: RunIdentifier, reason: String) {
