@@ -276,19 +276,44 @@ class FlyteTaskHandler extends TaskHandler {
      * task dir so the tasks consuming this one's outputs can chain on it.
      */
     protected String cacheKey() {
-        final env = new TreeMap<String,String>(task.environment ?: Collections.<String,String>emptyMap())
-        final identity = [
+        final identity = new ArrayList<String>()
+        identity.addAll([
             FlyteActionBuilder.CACHE_VERSION,
             task.processor.name,
             task.script,
             task.container,
-            env.toString(),
+        ])
+        identity.addAll(entries(task.environment))
+        // the `env` and `eval` outputs a cached .command.env must hold: `eval` ones are named by a
+        // pipeline-wide counter (`nxf_out_eval_<n>`), which another pipeline revision or Nextflow
+        // version numbers differently
+        identity.addAll(entries(task.outputEnvNames))
+        identity.addAll(entries(task.outputEvals))
+        identity.addAll([
             executor.binHash,
             executor.session.stubRun ? 'stub-run' : '',
-        ] as List<String>
+        ])
         final key = executor.cacheKeys.compute(task.getInputFilesMap(), identity)
         executor.cacheKeys.save(task.workDir, key)
         return key
+    }
+
+    /**
+     * A map as cache identity entries: its size, then each name and value, sorted by name. Each
+     * entry is hashed on its own, so values containing delimiters can't run into the next one.
+     */
+    static List<String> entries(Map<String,String> map) {
+        final sorted = new TreeMap<String,String>(map ?: Collections.<String,String>emptyMap())
+        final result = [sorted.size().toString()]
+        sorted.each { String name, String value -> result << name << value }
+        return result
+    }
+
+    /** A list as cache identity entries: its size, then each element */
+    static List<String> entries(List<String> list) {
+        final result = [(list?.size() ?: 0).toString()]
+        result.addAll(list ?: Collections.<String>emptyList())
+        return result
     }
 
     @Override
