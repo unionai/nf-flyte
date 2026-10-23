@@ -356,7 +356,9 @@ class FlyteTaskHandler extends TaskHandler {
         Files.walk(source).withCloseable { stream ->
             stream.filter { Path p -> !Files.isDirectory(p) }.forEach { Path file ->
                 final dest = target.resolve(source.relativize(file).toString())
-                if( dest.parent )
+                // only a local work dir needs its directories: on an object store, nf-amazon & co.
+                // create them as empty `dir/` objects, which copilot then fails to download as files
+                if( dest.parent && dest.fileSystem.provider().scheme == 'file' )
                     Files.createDirectories(dest.parent)
                 Files.copy(file, dest, StandardCopyOption.REPLACE_EXISTING)
             }
