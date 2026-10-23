@@ -16,6 +16,8 @@ one child action per task.
 - A failed task shows as failed in Flyte and is never cached; Nextflow still gets its exit
   code, stdout and stderr.
 - Killing a task or cancelling the pipeline aborts the matching Flyte actions.
+- Nothing polls Flyte. Task actions are enqueued through the Actions service, and their state
+  comes from its `WatchForUpdates` stream, which the head keeps open for the whole pipeline.
 
 ## Get Started
 
@@ -65,7 +67,7 @@ workDir = 's3://<bucket>/<path>'              // readable by Flyte, writable fro
 ```groovy
 flyte {
     queue = 'gpu'          // Flyte queue for task actions (default: the run's queue)
-    pollInterval = '10s'   // how often to poll task status (default: 5s)
+    pollInterval = '10s'   // fallback check of running tasks; status itself is pushed (default: 5s)
     cache = true           // cache task results in Flyte (default: true)
 }
 ```
@@ -119,6 +121,12 @@ produced by another task is identified by that task's key (saved in its task dir
 with `cache false`, and all tasks with `flyte.cache = false`, are never cached.
 
 ## Plugin development
+
+The Flyte client lives in the `controller` subproject (Kotlin, [connect-kotlin](https://github.com/connectrpc/connect-kotlin)):
+an informer over `ActionsService/WatchForUpdates` keeps every task action's state in memory, and
+the executor reads it from there. Its protobuf and Connect code is generated at build time from
+the flyteidl2 protos vendored in `controller/src/main/proto`; refresh them with
+`scripts/update-protos.sh <flyte tag>`. Building needs JDK 21.
 
 ```bash
 make assemble   # build

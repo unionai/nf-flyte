@@ -3,7 +3,12 @@ package unionai.plugin.executor
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutionException
 
+import flyteidl2.actions.ActionsServiceOuterClass.Action
+import flyteidl2.common.Phase.ActionPhase
+import flyteidl2.task.Common.Outputs
 import groovy.transform.CompileStatic
 import groovy.transform.PackageScope
 import groovy.util.logging.Slf4j
@@ -15,20 +20,22 @@ import nextflow.processor.TaskHandler
 import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
 import nextflow.trace.TraceRecord
-import unionai.plugin.client.FlyteClient
+import unionai.flyte.controller.ActionState
+import unionai.flyte.controller.Submitted
 import unionai.plugin.client.InputsProto
 import unionai.plugin.client.InputsProto.BlobInput
-import unionai.plugin.client.NotFoundException
 import unionai.plugin.executor.FlyteTaskLauncher.StagedInput
 
 /**
- * Runs one Nextflow task as a Flyte child action.
+ * Runs one Nextflow task as a Flyte child action. Its state comes from the executor's
+ * {@link unionai.flyte.controller.ActionController}, which watches it: checking it never calls Flyte.
  */
 @Slf4j
 @CompileStatic
 class FlyteTaskHandler extends TaskHandler {
 
-    private static final Set<String> STARTED_PHASES = (['ACTION_PHASE_RUNNING'] + FlyteClient.TERMINAL_PHASES) as Set
+    /** Where copilot's `outputs.pb` is, under the action's output URI */
+    static final String OUTPUTS_FILE = 'outputs.pb'
     /**
      * The executor reads a task's inputs from `<input_uri prefix>/inputs.pb`: it strips a trailing
      * `/inputs.pb` and appends it again, so the file must have exactly that name.
@@ -44,6 +51,10 @@ class FlyteTaskHandler extends TaskHandler {
     /** The task's {@link #cacheKey()}, computed once on submit */
     @PackageScope String taskKey
     @PackageScope List<StagedInput> stagedInputs
+    /** The enqueue in flight, until {@link #enqueued()} has seen it complete */
+    @PackageScope CompletableFuture<Submitted> submission
+    private Map<String,BlobInput> inputs
+    private boolean enqueued
 
     FlyteTaskHandler(TaskRun task, FlyteExecutor executor) {
         super(task)
@@ -79,16 +90,56 @@ class FlyteTaskHandler extends TaskHandler {
 
         taskKey = cacheKey()
         actionName = actionNameFor(task, taskKey)
-        final inputs = writeInputs()
-        if( !executor.client.enqueue(newAction(inputs)) && isAborted(actionName) ) {
-            // the failed head aborted this action when it shut down (Nextflow kills its running
-            // tasks on SIGTERM): run the task again, under its hash, which is new in this session
-            log.debug "[FLYTE] Action $actionName was aborted by a previous attempt, running the task again"
-            actionName = FlyteActionBuilder.actionName(task.hash.toString())
-            executor.client.enqueue(newAction(inputs))
-        }
+        inputs = writeInputs()
+        // the enqueue completes in the background: the monitor moves on to the next task
+        submission = executor.controller.submit(newAction(inputs))
         status = TaskStatus.SUBMITTED
         log.debug "[FLYTE] Process `${task.lazyName()}` submitted > action=$actionName; work-dir=${task.workDirStr}"
+    }
+
+    /**
+     * @return whether the task's action is enqueued; false while the enqueue is in flight
+     * @throws ProcessException when the enqueue failed
+     */
+    @PackageScope
+    boolean enqueued() {
+        if( enqueued )
+            return true
+        if( !submission.isDone() )
+            return false
+        final result = submitted()
+        if( result == Submitted.EXISTS && phase() == ActionPhase.ACTION_PHASE_ABORTED ) {
+            // the failed head aborted this action when it shut down (Nextflow kills its running
+            // tasks on SIGTERM): run the task again, under its hash, which is new in this session
+            final hashName = FlyteActionBuilder.actionName(task.hash.toString())
+            if( actionName != hashName ) {
+                log.debug "[FLYTE] Action $actionName was aborted by a previous attempt, running the task again"
+                actionName = hashName
+                submission = executor.controller.submit(newAction(inputs))
+                return false
+            }
+        }
+        if( result == Submitted.EXISTS )
+            log.debug "[FLYTE] Action $actionName already exists, attaching to it"
+        enqueued = true
+        return true
+    }
+
+    private Submitted submitted() {
+        try {
+            return submission.get()
+        }
+        catch( ExecutionException e ) {
+            throw new ProcessException("Unable to submit Flyte action $actionName: ${e.cause?.message}", e.cause)
+        }
+    }
+
+    private ActionState state() {
+        return executor.controller.state(actionName)
+    }
+
+    private ActionPhase phase() {
+        return state()?.phase
     }
 
     /**
@@ -102,11 +153,6 @@ class FlyteTaskHandler extends TaskHandler {
         return task.processor.isCacheable()
             ? FlyteActionBuilder.actionName(key, task.failCount)
             : FlyteActionBuilder.actionName(task.hash.toString())
-    }
-
-    private boolean isAborted(String name) {
-        final details = executor.client.getActionDetails(FlyteActionBuilder.actionId(executor.flyteConfig, name))
-        return ((details?.status as Map)?.phase as String) == 'ACTION_PHASE_ABORTED'
     }
 
     /**
@@ -139,7 +185,7 @@ class FlyteTaskHandler extends TaskHandler {
 
     private String inputsUriCache
 
-    protected Map newAction(Map<String,BlobInput> inputs) {
+    protected Action newAction(Map<String,BlobInput> inputs) {
         final builder = new FlyteActionBuilder(executor.flyteConfig)
         builder.name = actionName
         builder.shortName = FlyteActionBuilder.shortName(task.processor.name)
@@ -179,11 +225,10 @@ class FlyteTaskHandler extends TaskHandler {
 
     @Override
     boolean checkIfRunning() {
-        if( !actionName || !isSubmitted() )
+        if( !actionName || !isSubmitted() || !enqueued() )
             return false
-        // null until the action becomes readable, shortly after enqueue
-        final phase = executor.phaseOf(actionName)
-        if( phase in STARTED_PHASES ) {
+        // null until the watch reports the action, shortly after enqueue
+        if( state()?.started ) {
             status = TaskStatus.RUNNING
             return true
         }
@@ -194,16 +239,16 @@ class FlyteTaskHandler extends TaskHandler {
     boolean checkIfCompleted() {
         if( !isRunning() )
             return false
-        final phase = executor.phaseOf(actionName)
-        if( !(phase in FlyteClient.TERMINAL_PHASES) )
+        final state = state()
+        if( !state?.terminal )
             return false
 
         task.stdout = outputFile
         task.stderr = errorFile
-        if( phase == 'ACTION_PHASE_SUCCEEDED' )
-            completeSucceeded()
+        if( state.succeeded )
+            completeSucceeded(state)
         else
-            completeFailed(phase)
+            completeFailed(state)
         status = TaskStatus.COMPLETED
         return true
     }
@@ -212,8 +257,8 @@ class FlyteTaskHandler extends TaskHandler {
      * The action's `task_dir` output holds the task's outputs and `.command.*` files: copy it
      * into the Nextflow work dir, where Nextflow collects outputs and the exit status.
      */
-    private void completeSucceeded() {
-        final taskDir = taskDirOutput()
+    private void completeSucceeded(ActionState state) {
+        final taskDir = taskDirOutput(state)
         if( taskDir )
             copyTree(FileHelper.asPath(taskDir), task.workDir)
         final exitCode = readExitFile()
@@ -226,10 +271,24 @@ class FlyteTaskHandler extends TaskHandler {
         }
     }
 
-    private String taskDirOutput() {
+    /**
+     * Read the `task_dir` output from the action's `outputs.pb`, where the watch says it is, else
+     * ask the Run service for the action's outputs.
+     */
+    @PackageScope
+    String taskDirOutput(ActionState state) {
+        if( state.outputUri ) {
+            try {
+                final file = FileHelper.asPath(state.outputUri.replaceFirst(/\/+$/, '') + '/' + OUTPUTS_FILE)
+                return InputsProto.blobUri(Outputs.parseFrom(Files.readAllBytes(file)), FlyteTaskLauncher.TASK_DIR_OUTPUT)
+            }
+            catch( Exception e ) {
+                log.debug "[FLYTE] Cannot read ${state.outputUri}/$OUTPUTS_FILE of action $actionName, asking Flyte | ${e.message}"
+            }
+        }
         try {
-            final data = executor.client.getActionData(FlyteActionBuilder.actionId(executor.flyteConfig, actionName))
-            return FlyteClient.blobUri(data?.outputs as Map, FlyteTaskLauncher.TASK_DIR_OUTPUT)
+            final data = executor.runs.getActionData(FlyteActionBuilder.actionId(executor.flyteConfig, actionName))
+            return InputsProto.blobUri(data.outputs, FlyteTaskLauncher.TASK_DIR_OUTPUT)
         }
         catch( Exception e ) {
             log.debug "[FLYTE] Cannot read outputs of action $actionName | ${e.message}"
@@ -248,8 +307,9 @@ class FlyteTaskHandler extends TaskHandler {
         }
     }
 
-    private void completeFailed(String phase) {
-        final message = failureMessage(phase)
+    private void completeFailed(ActionState state) {
+        final phase = state.phase.name()
+        final message = failureMessage(state)
         final failure = TaskFailure.parse(message)
         if( failure ) {
             // the task script failed: restore what Nextflow expects to find in the work dir, and
@@ -273,20 +333,23 @@ class FlyteTaskHandler extends TaskHandler {
         }
     }
 
-    private String failureMessage(String phase) {
+    /**
+     * The error the watch reported; else, e.g. for an abort, the reason from the action's details.
+     */
+    private String failureMessage(ActionState state) {
+        if( state.error?.message )
+            return state.error.message
         try {
-            final details = executor.client.getActionDetails(FlyteActionBuilder.actionId(executor.flyteConfig, actionName))
-            final error = details?.errorInfo as Map
-            if( error?.message )
-                return error.message as String
-            final abort = details?.abortInfo as Map
-            if( abort?.reason )
-                return "aborted: ${abort.reason}"
+            final details = executor.runs.getActionDetails(FlyteActionBuilder.actionId(executor.flyteConfig, actionName))
+            if( details?.hasErrorInfo() && details.errorInfo.message )
+                return details.errorInfo.message
+            if( details?.hasAbortInfo() && details.abortInfo.reason )
+                return "aborted: ${details.abortInfo.reason}"
         }
         catch( Exception e ) {
             log.debug "[FLYTE] Cannot fetch details for action $actionName | ${e.message}"
         }
-        return phase
+        return state.phase.name()
     }
 
     /**
@@ -302,11 +365,17 @@ class FlyteTaskHandler extends TaskHandler {
     protected void killTask() {
         if( !actionName )
             return
-        try {
-            executor.client.abort(FlyteActionBuilder.actionId(executor.flyteConfig, actionName), 'Killed by Nextflow', executor.flyteConfig.parentAction)
-        }
-        catch( NotFoundException e ) {
-            log.debug "[FLYTE] Action $actionName not found while killing it"
+        // an enqueue still in flight would create the action after the abort: abort once it's done
+        final pending = submission && !submission.isDone() ? submission : CompletableFuture.completedFuture(null)
+        pending.handle { Object result, Throwable error -> abort(); return null }
+    }
+
+    private void abort() {
+        // completes in the background; the executor waits for pending aborts when it shuts down
+        final name = actionName
+        executor.controller.abort(name, 'Killed by Nextflow').exceptionally { Throwable e ->
+            log.debug "[FLYTE] Unable to abort action $name | ${e.message}"
+            return null
         }
     }
 

@@ -1,0 +1,279 @@
+syntax = "proto3";
+
+package flyteidl2.core;
+
+import "buf/validate/validate.proto";
+import "flyteidl2/core/artifact_id.proto";
+import "flyteidl2/core/types.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core";
+
+// Primitive Types
+message Primitive {
+  // Defines one of simple primitive types. These types will get translated into different programming languages as
+  // described in https://developers.google.com/protocol-buffers/docs/proto#scalar.
+  oneof value {
+    int64 integer = 1;
+    double float_value = 2;
+    string string_value = 3;
+    bool boolean = 4;
+    google.protobuf.Timestamp datetime = 5;
+    google.protobuf.Duration duration = 6;
+  }
+}
+
+// Used to denote a nil/null/None assignment to a scalar value. The underlying LiteralType for Void is intentionally
+// undefined since it can be assigned to a scalar of any LiteralType.
+message Void {}
+
+// Refers to an offloaded set of files. It encapsulates the type of the store and a unique uri for where the data is.
+// There are no restrictions on how the uri is formatted since it will depend on how to interact with the store.
+message Blob {
+  BlobMetadata metadata = 1;
+  string uri = 3;
+}
+
+message BlobMetadata {
+  BlobType type = 1;
+}
+
+// A simple byte array with a tag to help different parts of the system communicate about what is in the byte array.
+// It's strongly advisable that consumers of this type define a unique tag and validate the tag before parsing the data.
+message Binary {
+  bytes value = 1; // Serialized data (MessagePack) for supported types like Dataclass, Pydantic BaseModel, and untyped dict.
+  string tag = 2; // The serialization format identifier (e.g., MessagePack). Consumers must define unique tags and validate them before deserialization.
+}
+
+// A strongly typed schema that defines the interface of data retrieved from the underlying storage medium.
+message Schema {
+  string uri = 1;
+  SchemaType type = 3;
+}
+
+// The runtime representation of a tagged union value. See `UnionType` for more details.
+message Union {
+  Literal value = 1;
+  LiteralType type = 2;
+}
+
+message StructuredDatasetMetadata {
+  // Bundle the type information along with the literal.
+  // This is here because StructuredDatasets can often be more defined at run time than at compile time.
+  // That is, at compile time you might only declare a task to return a pandas dataframe or a StructuredDataset,
+  // without any column information, but at run time, you might have that column information.
+  // flytekit python will copy this type information into the literal, from the type information, if not provided by
+  // the various plugins (encoders).
+  // Since this field is run time generated, it's not used for any type checking.
+  StructuredDatasetType structured_dataset_type = 1;
+}
+
+message StructuredDataset {
+  // String location uniquely identifying where the data is.
+  // Should start with the storage location (e.g. s3://, gs://, bq://, etc.)
+  string uri = 1;
+
+  StructuredDatasetMetadata metadata = 2;
+}
+
+message Scalar {
+  oneof value {
+    Primitive primitive = 1;
+    Blob blob = 2;
+    Binary binary = 3;
+    Schema schema = 4;
+    Void none_type = 5;
+    Error error = 6;
+    google.protobuf.Struct generic = 7;
+    StructuredDataset structured_dataset = 8;
+    Union union = 9;
+  }
+}
+
+// A simple value. This supports any level of nesting (e.g. array of array of array of Blobs) as well as simple primitives.
+message Literal {
+  reserved 6, 7;
+  oneof value {
+    // A simple value.
+    Scalar scalar = 1;
+
+    // A collection of literals to allow nesting.
+    LiteralCollection collection = 2;
+
+    // A map of strings to literals.
+    LiteralMap map = 3;
+
+    // Offloaded literal metadata
+    // When you deserialize the offloaded metadata, it would be of Literal and its type would be defined by LiteralType stored in offloaded_metadata.
+    LiteralOffloadedMetadata offloaded_metadata = 8;
+  }
+
+  // A hash representing this literal.
+  // This is used for caching purposes. For more details refer to RFC 1893
+  // (https://github.com/flyteorg/flyte/blob/master/rfc/system/1893-caching-of-offloaded-objects.md)
+  string hash = 4;
+
+  // Additional metadata for literals.
+  map<string, string> metadata = 5;
+
+  // Identity of the artifact this value is / came from. Set once at artifact
+  // registration (and by clients when binding a fetched artifact as an input);
+  // it travels with the value through every copy. Participates in cache-key
+  // hashing by design: two versions of an artifact are distinct inputs even
+  // when their bytes coincide.
+  ArtifactVersionId artifact_id = 9;
+}
+
+// A message that contains the metadata of the offloaded data.
+message LiteralOffloadedMetadata {
+  // The location of the offloaded core.Literal.
+  string uri = 1;
+
+  // The size of the offloaded data.
+  uint64 size_bytes = 2;
+
+  // The inferred literal type of the offloaded data.
+  LiteralType inferred_type = 3;
+}
+
+// A collection of literals. This is a workaround since oneofs in proto messages cannot contain a repeated field.
+message LiteralCollection {
+  repeated Literal literals = 1;
+}
+
+// A map of literals. This is a workaround since oneofs in proto messages cannot contain a repeated field.
+message LiteralMap {
+  map<string, Literal> literals = 1;
+}
+
+// A collection of BindingData items.
+message BindingDataCollection {
+  repeated BindingData bindings = 1;
+}
+
+// A map of BindingData items.
+message BindingDataMap {
+  map<string, BindingData> bindings = 1;
+}
+
+message UnionInfo {
+  LiteralType targetType = 1;
+}
+
+// Specifies either a simple value or a reference to another output.
+message BindingData {
+  oneof value {
+    // A simple scalar value.
+    Scalar scalar = 1;
+
+    // A collection of binding data. This allows nesting of binding data to any number
+    // of levels.
+    BindingDataCollection collection = 2;
+
+    // References an output promised by another node.
+    OutputReference promise = 3;
+
+    // A map of bindings. The key is always a string.
+    BindingDataMap map = 4;
+
+    // Offloaded literal metadata
+    // When you deserialize the offloaded metadata, it would be of Literal and its type would be defined by LiteralType stored in offloaded_metadata.
+    // Used for nodes that don't have promises from upstream nodes such as ArrayNode subNodes.
+    LiteralOffloadedMetadata offloaded_metadata = 6;
+  }
+
+  UnionInfo union = 5;
+}
+
+// An input/output binding of a variable to either static value or a node output.
+message Binding {
+  // Variable name must match an input/output variable of the node.
+  string var = 1;
+
+  // Data to use to bind this variable.
+  BindingData binding = 2;
+}
+
+// A generic key value pair.
+message KeyValuePair {
+  //required.
+  string key = 1;
+
+  //+optional.
+  string value = 2;
+}
+
+// Backoff policy applied between user retries. Computed delay for retry n
+// (0-indexed) is: min(base * factor**n, cap). All fields are optional; if
+// all are unset, no backoff is applied (retries fire immediately). An unset
+// factor is interpreted as 1.0 (constant delay).
+message Backoff {
+  option (buf.validate.message).cel = {
+    id: "backoff.cap_required_when_factor_gt_1"
+    message: "cap is required when factor > 1 to prevent unbounded retry delay growth"
+    expression: "!has(this.factor) || this.factor <= 1.0 || has(this.cap)"
+  };
+
+  // Initial delay before the first retry. Must be >= 0 when set.
+  google.protobuf.Duration base = 1 [(buf.validate.field).duration = {
+    gte: {seconds: 0}
+  }];
+
+  // Multiplier applied per retry. factor=1 yields constant delay; factor=2
+  // doubles each time. When unset, factor is treated as 1.0. Must be >= 1.0
+  // when set.
+  optional double factor = 2 [(buf.validate.field).double.gte = 1.0];
+
+  // Upper bound on the computed delay. Required when factor > 1 to prevent
+  // unbounded growth. Must be >= 0 when set.
+  google.protobuf.Duration cap = 3 [(buf.validate.field).duration = {
+    gte: {seconds: 0}
+  }];
+}
+
+// Retry strategy associated with an executable unit.
+message RetryStrategy {
+  // Number of user retries. Retries are consumed when the job fails with a
+  // recoverable error. Retries are NOT consumed when user code raises
+  // NonRecoverableError (see ContainerError.Kind.NON_RECOVERABLE).
+  // The number of retries must be less than or equal to 10.
+  uint32 retries = 5;
+
+  // Optional backoff policy applied between user retries. If unset, retries
+  // fire immediately back-to-back. Backoff applies only to user retries;
+  // system retries are governed by platform recovery policy.
+  Backoff backoff = 6;
+}
+
+// Timeout strategy for an action — additional bounds layered on top of
+// TaskMetadata.timeout (the per-attempt RUNNING-phase bound, a.k.a.
+// max_runtime). Each field below is independently optional. For every
+// duration field in this message, a value of 0 (or an unset field) is
+// interpreted as unlimited (no bound applied). Negative values are
+// rejected.
+//
+// queued_timeout is anchored per attempt (resets on retry). deadline is
+// anchored once at the timestamp the action first entered
+// ACTION_PHASE_QUEUED, recorded by the actions service and reused across
+// all attempts (user or system).
+message TimeoutStrategy {
+  // Wall-clock spent in ACTION_PHASE_QUEUED + ACTION_PHASE_WAITING_FOR_RESOURCES
+  // before the action enters ACTION_PHASE_INITIALIZING. Per attempt — resets
+  // on each retry. Enforced by the leasor (pre-lease) and the lease worker
+  // (post-lease, before user code starts). 0 (or unset) means unlimited.
+  google.protobuf.Duration queued_timeout = 1 [(buf.validate.field).duration = {
+    gte: {seconds: 0}
+  }];
+
+  // Wall-clock from first ACTION_PHASE_QUEUED timestamp to a terminal phase,
+  // across ALL attempts (user and system). One-time, absolute. If deadline
+  // fires while an attempt is mid-flight, the attempt is reaped and the
+  // action terminates as TIMED_OUT regardless of TaskMetadata.timeout or
+  // remaining retry budget. Enforced by the leasor. 0 (or unset) means
+  // unlimited.
+  google.protobuf.Duration deadline = 2 [(buf.validate.field).duration = {
+    gte: {seconds: 0}
+  }];
+}

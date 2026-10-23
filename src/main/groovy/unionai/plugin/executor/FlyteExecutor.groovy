@@ -1,9 +1,9 @@
 package unionai.plugin.executor
 
 import java.nio.file.Path
+import java.time.Duration
 
 import groovy.transform.CompileStatic
-import groovy.transform.PackageScope
 import groovy.util.logging.Slf4j
 import nextflow.exception.AbortOperationException
 import nextflow.exception.AbortSignalException
@@ -15,7 +15,10 @@ import nextflow.processor.TaskPollingMonitor
 import nextflow.processor.TaskRun
 import nextflow.util.ServiceName
 import org.pf4j.ExtensionPoint
-import unionai.plugin.client.FlyteClient
+import unionai.flyte.controller.ActionController
+import unionai.flyte.controller.ActionState
+import unionai.flyte.controller.FlyteConnection
+import unionai.flyte.controller.RunClient
 import unionai.plugin.config.FlyteConfig
 
 /**
@@ -26,26 +29,30 @@ import unionai.plugin.config.FlyteConfig
  * go in as File / Dir inputs and its work dir comes back as a Dir output (see
  * {@link FlyteTaskLauncher}). Task pods never access the work dir themselves, so it can be on
  * any object store that both Nextflow and Flyte can read.
+ *
+ * Task actions are enqueued through the Actions service, and their state comes from its watch of
+ * the parent action's children (see {@link ActionController}): task handlers read it from memory,
+ * and every change wakes the task monitor, so nothing polls Flyte.
  */
 @Slf4j
 @ServiceName('flyte')
 @CompileStatic
 class FlyteExecutor extends Executor implements ExtensionPoint {
 
+    /** How long to wait for the watch to list the parent's existing children */
+    static final Duration WATCH_SYNC_TIMEOUT = Duration.ofMinutes(2)
+
     private FlyteConfig flyteConfig
-    private FlyteClient client
+    private FlyteConnection connection
+    private ActionController controller
     private Path remoteBinDir
     private FlyteCacheKey cacheKeys
     private StandaloneRun standaloneRun
     private String binHash = ''
 
-    // Status of every action in the run, refreshed at most once per poll interval
-    // with a single paged ListActions call shared by all task handlers.
-    private volatile Map<String,String> phases = Collections.emptyMap()
-    private volatile long phasesRefreshedAt = 0
-
     FlyteConfig getFlyteConfig() { flyteConfig }
-    FlyteClient getClient() { client }
+    ActionController getController() { controller }
+    RunClient getRuns() { connection.runs }
     Path getRemoteBinDir() { remoteBinDir }
     FlyteCacheKey getCacheKeys() { cacheKeys }
     String getBinHash() { binHash }
@@ -71,10 +78,11 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
         createConfig()
         validateWorkDir()
         uploadBinDir()
-        createClient()
+        createConnection()
         cacheKeys = new FlyteCacheKey(getWorkDir())
         if( flyteConfig.standalone )
             startStandaloneRun()
+        startController()
     }
 
     protected void createConfig() {
@@ -104,29 +112,50 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
         }
     }
 
-    protected void createClient() {
-        client = new FlyteClient("https://${flyteConfig.endpoint}", flyteConfig.apiKey, flyteConfig.authCommand)
+    protected void createConnection() {
+        connection = FlyteConnection.create(flyteConfig.endpoint, flyteConfig.apiKey, flyteConfig.authCommand)
     }
 
     /**
      * Launched outside Flyte: create the run the task actions go into (see {@link StandaloneRun})
      */
     protected void startStandaloneRun() {
-        standaloneRun = new StandaloneRun(flyteConfig, client, getWorkDir())
+        standaloneRun = new StandaloneRun(flyteConfig, connection.runs, getWorkDir())
         standaloneRun.start()
+    }
+
+    /**
+     * Watch the task actions, i.e. the children of the action running the Nextflow head
+     */
+    protected void startController() {
+        controller = connection.controller(FlyteActionBuilder.runId(flyteConfig), flyteConfig.parentAction)
+        controller.addListener { ActionState state ->
+            // a task started or finished: let the monitor check it now, not at the next poll
+            final monitor = getMonitor()
+            if( state.started && monitor instanceof TaskPollingMonitor )
+                ((TaskPollingMonitor) monitor).signal()
+        }
+        controller.start(WATCH_SYNC_TIMEOUT)
     }
 
     @Override
     void shutdown() {
-        if( !standaloneRun )
-            return
-        // the run's root action ends with the pipeline; stopped by a signal (Ctrl+C, SIGTERM,
-        // SIGHUP), the run is aborted instead, as the user asked
-        final error = session.error
-        if( error instanceof AbortSignalException )
-            standaloneRun.abort("Cancelled from Nextflow (${error.message})")
-        else
-            standaloneRun.finish(session.isSuccess())
+        try {
+            if( standaloneRun ) {
+                // the run's root action ends with the pipeline; stopped by a signal (Ctrl+C,
+                // SIGTERM, SIGHUP), the run is aborted instead, as the user asked
+                final error = session.error
+                if( error instanceof AbortSignalException )
+                    standaloneRun.abort("Cancelled from Nextflow (${error.message})")
+                else
+                    standaloneRun.finish(session.isSuccess())
+            }
+        }
+        finally {
+            // waits briefly for the aborts of killed tasks
+            controller?.close()
+            connection?.close()
+        }
     }
 
     @Override
@@ -138,26 +167,5 @@ class FlyteExecutor extends Executor implements ExtensionPoint {
     @Override
     TaskHandler createTaskHandler(TaskRun task) {
         return new FlyteTaskHandler(task, this)
-    }
-
-    /**
-     * @return the last known phase of the named action, refreshing the run-wide phase
-     *      snapshot when it is older than the poll interval
-     */
-    String phaseOf(String actionName) {
-        final maxAge = flyteConfig.pollInterval.toMillis()
-        if( System.currentTimeMillis() - phasesRefreshedAt > maxAge )
-            refreshPhases(maxAge)
-        return phases.get(actionName)
-    }
-
-    @PackageScope
-    synchronized void refreshPhases(long maxAge) {
-        // another handler may have refreshed while this one waited on the lock
-        if( System.currentTimeMillis() - phasesRefreshedAt <= maxAge )
-            return
-        phases = client.listActionPhases(FlyteActionBuilder.runId(flyteConfig))
-        phasesRefreshedAt = System.currentTimeMillis()
-        log.trace "[FLYTE] refreshed phases of ${phases.size()} actions"
     }
 }

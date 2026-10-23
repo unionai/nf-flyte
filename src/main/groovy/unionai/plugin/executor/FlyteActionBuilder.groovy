@@ -1,12 +1,38 @@
 package unionai.plugin.executor
 
+import com.google.protobuf.StringValue
+import flyteidl2.actions.ActionsServiceOuterClass.Action
+import flyteidl2.common.Identifier.ActionIdentifier
+import flyteidl2.common.Identifier.RunIdentifier
+import flyteidl2.core.IdentifierOuterClass.Identifier
+import flyteidl2.core.IdentifierOuterClass.ResourceType
+import flyteidl2.core.Interface.TypedInterface
+import flyteidl2.core.Interface.Variable
+import flyteidl2.core.Interface.VariableEntry
+import flyteidl2.core.Interface.VariableMap
+import flyteidl2.core.Literals.KeyValuePair
+import flyteidl2.core.Literals.RetryStrategy
+import flyteidl2.core.Tasks.Container
+import flyteidl2.core.Tasks.DataLoadingConfig
+import flyteidl2.core.Tasks.IOStrategy
+import flyteidl2.core.Tasks.Resources
+import flyteidl2.core.Tasks.Resources.ResourceEntry
+import flyteidl2.core.Tasks.Resources.ResourceName
+import flyteidl2.core.Tasks.RuntimeMetadata
+import flyteidl2.core.Tasks.TaskMetadata
+import flyteidl2.core.Tasks.TaskTemplate
+import flyteidl2.core.Types.BlobType
+import flyteidl2.core.Types.LiteralType
+import flyteidl2.task.TaskDefinition.TaskIdentifier
+import flyteidl2.task.TaskDefinition.TaskSpec
+import flyteidl2.workflow.RunDefinition.TaskAction
 import groovy.transform.CompileStatic
 import nextflow.util.Duration
 import nextflow.util.MemoryUnit
 import unionai.plugin.config.FlyteConfig
 
 /**
- * Builds the JSON-shaped `flyteidl2.actions.Action` for a Nextflow task: a raw container task
+ * Builds the `flyteidl2.actions.Action` for a Nextflow task: a raw container task
  * whose inputs and outputs Flyte's copilot moves. Every staged input is a File or Dir input, and
  * the task's work dir comes back as the `task_dir` Dir output. Flyte retries stay off, because
  * Nextflow's `errorStrategy` owns them; Flyte caching is keyed on the Nextflow task hash.
@@ -41,104 +67,120 @@ class FlyteActionBuilder {
         this.config = config
     }
 
-    Map build() {
-        final action = [
-            actionId: actionId(config, name),
-            parentActionName: config.parentAction,
-            inputUri: inputsUri,
-            runOutputBase: config.runOutputBase,
-            task: taskAction(),
-        ] as Map<String,Object>
+    Action build() {
+        final action = Action.newBuilder()
+            .setActionId(actionId(config, name))
+            .setParentActionName(config.parentAction)
+            .setInputUri(inputsUri)
+            .setRunOutputBase(config.runOutputBase)
+            .setTask(taskAction())
         if( group )
-            action.group = group
-        return action
+            action.setGroup(group)
+        return action.build()
     }
 
-    private Map taskAction() {
-        final result = [spec: [taskTemplate: taskTemplate(), shortName: truncate(shortName, 63)]] as Map<String,Object>
+    private TaskAction taskAction() {
+        final template = taskTemplate()
+        final tid = template.id
+        final result = TaskAction.newBuilder()
+            .setId(TaskIdentifier.newBuilder().setOrg(tid.org).setProject(tid.project).setDomain(tid.domain).setName(tid.name).setVersion(tid.version))
+            .setSpec(TaskSpec.newBuilder().setTaskTemplate(template).setShortName(truncate(shortName, 63)))
         if( config.queue )
-            result.queue = config.queue
+            result.setQueue(config.queue)
         if( cacheKey )
-            result.cacheKey = cacheKey
-        return result
+            result.setCacheKey(StringValue.of(cacheKey))
+        return result.build()
     }
 
-    private Map taskTemplate() {
-        final metadata = [
-            runtime: [type: 'OTHER', flavor: 'nextflow'],
-            retries: [retries: 0],
-        ] as Map<String,Object>
+    private TaskTemplate taskTemplate() {
+        final metadata = TaskMetadata.newBuilder()
+            .setRuntime(RuntimeMetadata.newBuilder().setType(RuntimeMetadata.RuntimeType.OTHER).setFlavor('nextflow'))
+            .setRetries(RetryStrategy.newBuilder().setRetries(0))
         if( time )
-            metadata.timeout = "${time.toSeconds()}s".toString()
+            metadata.setTimeout(com.google.protobuf.Duration.newBuilder().setSeconds(time.toSeconds()))
         if( cacheKey ) {
-            metadata.discoverable = true
-            metadata.discoveryVersion = CACHE_VERSION
+            metadata.setDiscoverable(true)
+            metadata.setDiscoveryVersion(CACHE_VERSION)
         }
 
-        return [
-            id: [
-                resourceType: 'TASK',
-                org: config.org,
-                project: config.project,
-                domain: config.domain,
-                name: truncate(shortName, 255),
-                version: TASK_VERSION,
-            ],
-            type: 'raw-container',
-            metadata: metadata,
-            interface: [
-                inputs: [variables: inputs.collect { name, dir -> variable(name, dir) }],
-                outputs: [variables: [variable(FlyteTaskLauncher.TASK_DIR_OUTPUT, true)]],
-            ],
-            container: container(),
-        ]
+        final inputVars = VariableMap.newBuilder()
+        inputs.each { String name, Boolean dir -> inputVars.addVariables(variable(name, dir)) }
+
+        return TaskTemplate.newBuilder()
+            .setId(Identifier.newBuilder()
+                .setResourceType(ResourceType.TASK)
+                .setOrg(config.org)
+                .setProject(config.project)
+                .setDomain(config.domain)
+                .setName(truncate(shortName, 255))
+                .setVersion(TASK_VERSION))
+            .setType('raw-container')
+            .setMetadata(metadata)
+            .setInterface(TypedInterface.newBuilder()
+                .setInputs(inputVars)
+                .setOutputs(VariableMap.newBuilder().addVariables(variable(FlyteTaskLauncher.TASK_DIR_OUTPUT, true))))
+            .setContainer(container())
+            .build()
     }
 
-    private static Map variable(String name, boolean dir) {
-        return [key: name, value: [type: [blob: [format: '', dimensionality: dir ? 'MULTIPART' : 'SINGLE']]]]
+    private static VariableEntry variable(String name, boolean dir) {
+        final blob = BlobType.newBuilder()
+            .setDimensionality(dir ? BlobType.BlobDimensionality.MULTIPART : BlobType.BlobDimensionality.SINGLE)
+        return VariableEntry.newBuilder()
+            .setKey(name)
+            .setValue(Variable.newBuilder().setType(LiteralType.newBuilder().setBlob(blob)))
+            .build()
     }
 
-    private Map container() {
-        final result = [
-            image: image,
-            command: ['bash', '-c', FlyteTaskLauncher.ENTRYPOINT],
-            dataConfig: [
-                enabled: true,
-                inputPath: FlyteTaskLauncher.POD_INPUTS,
-                outputPath: FlyteTaskLauncher.POD_OUTPUTS,
-                format: 'JSON',
-                ioStrategy: [downloadMode: 'DOWNLOAD_EAGER', uploadMode: 'UPLOAD_ON_EXIT'],
+    private Container container() {
+        final result = Container.newBuilder()
+            .setImage(image)
+            .addAllCommand(['bash', '-c', FlyteTaskLauncher.ENTRYPOINT])
+            .setDataConfig(DataLoadingConfig.newBuilder()
+                .setEnabled(true)
+                .setInputPath(FlyteTaskLauncher.POD_INPUTS)
+                .setOutputPath(FlyteTaskLauncher.POD_OUTPUTS)
+                .setFormat(DataLoadingConfig.LiteralMapFormat.JSON)
+                .setIoStrategy(IOStrategy.newBuilder()
+                    .setDownloadMode(IOStrategy.DownloadMode.DOWNLOAD_EAGER)
+                    .setUploadMode(IOStrategy.UploadMode.UPLOAD_ON_EXIT))
                 // each File keeps its original name, in its own directory
-                fileInputLayout: 'NAMED_DIR',
-            ],
-        ] as Map<String,Object>
+                .setFileInputLayout(DataLoadingConfig.FileInputLayout.NAMED_DIR))
         final resources = resources()
         if( resources )
-            result.resources = [requests: resources, limits: resources]
-        if( env )
-            result.env = env.collect { k, v -> [key: k, value: v] }
-        return result
+            result.setResources(Resources.newBuilder().addAllRequests(resources).addAllLimits(resources))
+        env.each { String k, String v -> result.addEnv(KeyValuePair.newBuilder().setKey(k).setValue(v)) }
+        return result.build()
     }
 
-    private List<Map> resources() {
-        final result = new ArrayList<Map>()
+    private List<ResourceEntry> resources() {
+        final result = new ArrayList<ResourceEntry>()
         if( cpus )
-            result << [name: 'CPU', value: cpus.toString()]
+            result << resource(ResourceName.CPU, cpus.toString())
         if( memory )
-            result << [name: 'MEMORY', value: "${memory.toMega()}Mi".toString()]
+            result << resource(ResourceName.MEMORY, "${memory.toMega()}Mi".toString())
         if( gpus )
-            result << [name: 'GPU', value: gpus.toString()]
+            result << resource(ResourceName.GPU, gpus.toString())
         if( disk )
-            result << [name: 'EPHEMERAL_STORAGE', value: "${disk.toMega()}Mi".toString()]
+            result << resource(ResourceName.EPHEMERAL_STORAGE, "${disk.toMega()}Mi".toString())
         return result
     }
 
-    static Map runId(FlyteConfig config) {
-        return [org: config.org, project: config.project, domain: config.domain, name: config.runName]
+    private static ResourceEntry resource(ResourceName name, String value) {
+        ResourceEntry.newBuilder().setName(name).setValue(value).build()
     }
 
-    static Map actionId(FlyteConfig config, String name) {
-        return [run: runId(config), name: name]
+    static RunIdentifier runId(FlyteConfig config) {
+        return RunIdentifier.newBuilder()
+            .setOrg(config.org)
+            .setProject(config.project)
+            .setDomain(config.domain)
+            .setName(config.runName)
+            .build()
+    }
+
+    static ActionIdentifier actionId(FlyteConfig config, String name) {
+        return ActionIdentifier.newBuilder().setRun(runId(config)).setName(name).build()
     }
 
     /**

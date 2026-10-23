@@ -1,5 +1,6 @@
 package unionai.plugin.client
 
+import flyteidl2.task.Common.Outputs
 import spock.lang.Specification
 import unionai.plugin.client.InputsProto.BlobInput
 
@@ -34,5 +35,18 @@ class InputsProtoTest extends Specification {
         then: 'the outer length is a 2-byte varint and the uri survives intact'
         (bytes[1] & 0x80) != 0
         new String(bytes, 'UTF-8').contains(uri)
+    }
+
+    def 'should find a blob output by name'() {
+        given: 'Outputs share the literals field with Inputs'
+        def outputs = Outputs.parseFrom(InputsProto.encode([
+            new BlobInput('task_dir', 's3://b/out/task_dir', true),
+            new BlobInput('other', 's3://b/out/other', false),
+        ]))
+
+        expect:
+        InputsProto.blobUri(outputs, 'task_dir') == 's3://b/out/task_dir'
+        InputsProto.blobUri(outputs, 'missing') == null
+        InputsProto.blobUri(null, 'task_dir') == null
     }
 }

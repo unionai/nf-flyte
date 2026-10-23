@@ -1,0 +1,90 @@
+// Flyte v2 controller for the JVM: enqueues actions through the Actions service and keeps their
+// state in memory from its WatchForUpdates stream (an informer), so callers never poll Flyte.
+plugins {
+    id 'org.jetbrains.kotlin.jvm' version '2.4.21'
+    id 'com.google.protobuf' version '0.10.0'
+    id 'java-library'
+}
+
+def protobufVersion = '4.36.2'
+def connectVersion = '0.10.0'
+
+repositories {
+    mavenCentral()
+}
+
+kotlin {
+    jvmToolchain(21)
+    compilerOptions {
+        // Nextflow runs on Java 17+
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+        freeCompilerArgs.add('-Xjvm-default=all')
+    }
+}
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(21) }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+}
+
+dependencies {
+    api "com.google.protobuf:protobuf-javalite:$protobufVersion"
+    api "com.connectrpc:connect-kotlin:$connectVersion"
+    implementation "com.connectrpc:connect-kotlin-okhttp:$connectVersion"
+    implementation "com.connectrpc:connect-kotlin-google-javalite-ext:$connectVersion"
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0'
+    implementation 'com.squareup.moshi:moshi:1.15.2'
+    // provided by Nextflow
+    compileOnly 'org.slf4j:slf4j-api:2.0.17'
+    testImplementation 'org.slf4j:slf4j-api:2.0.17'
+
+    testImplementation 'org.jetbrains.kotlin:kotlin-test-junit5'
+    testImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0'
+    testImplementation 'com.squareup.okhttp3:mockwebserver3:5.5.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testRuntimeOnly 'org.slf4j:slf4j-simple:2.0.17'
+}
+
+// protoc-gen-connect-kotlin ships as a runnable jar, not a native binary: run it through a launcher
+configurations { connectKotlinPlugin }
+dependencies {
+    connectKotlinPlugin("com.connectrpc:protoc-gen-connect-kotlin:$connectVersion") { transitive = false }
+}
+
+def connectKotlinLauncher = layout.buildDirectory.file('protoc-plugins/protoc-gen-connect-kotlin')
+def writeConnectKotlinLauncher = tasks.register('writeConnectKotlinLauncher') {
+    def jar = configurations.connectKotlinPlugin
+    def java = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }
+    inputs.files(jar)
+    outputs.file(connectKotlinLauncher)
+    doLast {
+        def script = connectKotlinLauncher.get().asFile
+        script.text = "#!/bin/sh\nexec '${java.get().executablePath}' -jar '${jar.singleFile}' \"\$@\"\n"
+        script.setExecutable(true)
+    }
+}
+
+protobuf {
+    protoc { artifact = "com.google.protobuf:protoc:$protobufVersion" }
+    plugins {
+        connectkotlin { path = connectKotlinLauncher.get().asFile.path }
+    }
+    generateProtoTasks {
+        all().configureEach {
+            dependsOn writeConnectKotlinLauncher
+            builtins {
+                java { option 'lite' }
+            }
+            plugins {
+                connectkotlin {}
+            }
+        }
+    }
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}

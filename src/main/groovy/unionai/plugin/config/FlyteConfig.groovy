@@ -9,7 +9,7 @@ import nextflow.config.spec.ConfigScope
 import nextflow.config.spec.ScopeName
 import nextflow.script.dsl.Description
 import nextflow.util.Duration
-import unionai.plugin.client.FlyteClient
+import unionai.flyte.controller.ApiKey
 
 /**
  * The `flyte` config scope.
@@ -58,7 +58,7 @@ class FlyteConfig implements ConfigScope {
     String queue
 
     @ConfigOption
-    @Description('How often to poll Flyte for task status (default: `5s`).')
+    @Description('How often Nextflow checks its running tasks when no update arrives (default: `5s`). Task status comes from a watch of the run, not from polling Flyte, so this is only a fallback.')
     Duration pollInterval
 
     @ConfigOption
@@ -101,7 +101,7 @@ class FlyteConfig implements ConfigScope {
         // an API key also names its endpoint and org
         if( apiKey && (!endpoint || !org) ) {
             try {
-                final key = FlyteClient.decodeApiKey(apiKey)
+                final key = ApiKey.decode(apiKey)
                 endpoint = endpoint ?: stripScheme(key.endpoint)
                 org = org ?: key.org
             }

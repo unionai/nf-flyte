@@ -7,11 +7,29 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
+import flyteidl2.common.Identifier.ActionIdentifier
+import flyteidl2.common.Identifier.RunIdentifier
+import flyteidl2.core.IdentifierOuterClass.Identifier
+import flyteidl2.core.IdentifierOuterClass.ResourceType
+import flyteidl2.core.Interface.TypedInterface
+import flyteidl2.core.Literals.RetryStrategy
+import flyteidl2.core.Tasks.Container
+import flyteidl2.core.Tasks.Resources
+import flyteidl2.core.Tasks.Resources.ResourceEntry
+import flyteidl2.core.Tasks.Resources.ResourceName
+import flyteidl2.core.Tasks.RuntimeMetadata
+import flyteidl2.core.Tasks.TaskMetadata
+import flyteidl2.core.Tasks.TaskTemplate
+import flyteidl2.dataproxy.DataproxyService.UploadInputsRequest
+import flyteidl2.task.Common.Inputs
+import flyteidl2.task.TaskDefinition.TaskSpec
+import flyteidl2.workflow.RunServiceOuterClass.CreateRunRequest
+import flyteidl2.workflow.RunServiceOuterClass.GetActionDataURIsResponse
 import groovy.transform.CompileStatic
 import groovy.transform.PackageScope
 import groovy.util.logging.Slf4j
 import nextflow.extension.FilesEx
-import unionai.plugin.client.FlyteClient
+import unionai.flyte.controller.RunClient
 import unionai.plugin.config.FlyteConfig
 
 /**
@@ -32,22 +50,38 @@ class StandaloneRun {
     static final String SUCCEEDED = 'succeeded'
     static final String FAILED = 'failed'
     static final String ABORTED = 'aborted'
+    /** Replaced by Flyte with where the root action's outputs go */
+    static final String OUTPUT_PREFIX = '{{.outputPrefix}}'
 
     /**
      * The root action's program (Python, in the Flyte runtime image, whose storage layer reads
-     * any object store with the pod's credentials). Args: status file, heartbeat file, timeout.
+     * any object store with the pod's credentials). Args: status file, heartbeat file, timeout,
+     * and the action's output prefix (templated by Flyte), where it writes its empty outputs.
      */
     static final String WATCHER = '''\
         import sys, time
 
         status, heartbeat, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
-        if "://" in status:
-            import flyte.storage
-            fs = flyte.storage.get_underlying_filesystem(path=status)
-            exists, read = fs.exists, lambda p: fs.cat_file(p).decode()
-        else:
+        outputs = sys.argv[4].rstrip("/") + "/outputs.pb" if len(sys.argv) > 4 else None
+
+        def fs_for(path):
+            if "://" in path:
+                import flyte.storage
+                fs = flyte.storage.get_underlying_filesystem(path=path)
+                return fs.exists, lambda p: fs.cat_file(p).decode(), lambda p, b: fs.pipe_file(p, b)
             import os
-            exists, read = os.path.exists, lambda p: open(p).read()
+            def write(p, b):
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "wb").write(b)
+            return os.path.exists, lambda p: open(p).read(), write
+
+        exists, read, _ = fs_for(status)
+
+        def succeed():
+            # the root has no outputs: an empty outputs.pb tells Flyte (and its UI) so
+            if outputs:
+                fs_for(outputs)[2](outputs, b"")
+            sys.exit(0)
 
         started = time.time()
         print("Waiting for the Nextflow head to finish", flush=True)
@@ -55,7 +89,9 @@ class StandaloneRun {
             if exists(status):
                 result = read(status).strip()
                 print(f"Nextflow head reported: {result}", flush=True)
-                sys.exit(0 if result == "succeeded" else 1)
+                if result == "succeeded":
+                    succeed()
+                sys.exit(1)
             try:
                 last = float(read(heartbeat).strip())
             except Exception:
@@ -67,16 +103,16 @@ class StandaloneRun {
         '''.stripIndent()
 
     private final FlyteConfig config
-    private final FlyteClient client
+    private final RunClient runs
     private final Path markerDir
     private ScheduledExecutorService heartbeats
 
     @PackageScope String runName
-    private Map runId
+    private RunIdentifier runId
 
-    StandaloneRun(FlyteConfig config, FlyteClient client, Path workDir) {
+    StandaloneRun(FlyteConfig config, RunClient runs, Path workDir) {
         this.config = config
-        this.client = client
+        this.runs = runs
         this.markerDir = workDir.resolve(".flyte/heads/${UUID.randomUUID()}")
     }
 
@@ -90,16 +126,27 @@ class StandaloneRun {
     void start() {
         Files.createDirectories(markerDir)
         beat()
-        final run = client.createRun([
-            projectId: [organization: config.org, name: config.project, domain: config.domain],
-            taskSpec: rootSpec(),
-        ])
-        final id = ((run.action as Map).id as Map).run as Map
-        runId = id
-        runName = id.name as String
+        final id = RunIdentifier.newBuilder()
+            .setOrg(config.org).setProject(config.project).setDomain(config.domain).setName(newRunName())
+            .build()
+        final spec = rootSpec()
+        // the root has no inputs: store empty ones under the run, as the Flyte SDK does, so the
+        // run has inputs to show (CreateRun stores none for an empty inline Inputs)
+        final inputs = runs.uploadInputs(UploadInputsRequest.newBuilder()
+            .setRunId(id)
+            .setTaskSpec(spec)
+            .setInputs(Inputs.getDefaultInstance())
+            .build())
+        final run = runs.createRun(CreateRunRequest.newBuilder()
+            .setRunId(id)
+            .setTaskSpec(spec)
+            .setOffloadedInputData(inputs)
+            .build())
+        runId = run.action.id.run
+        runName = runId.name
         config.runName = runName
         config.parentAction = HEAD_ACTION
-        config.runOutputBase = runOutputBase(client.getActionDataUris([run: id, name: HEAD_ACTION]))
+        config.runOutputBase = runOutputBase(runs.getActionDataUris(ActionIdentifier.newBuilder().setRun(runId).setName(HEAD_ACTION).build()))
 
         heartbeats = Executors.newSingleThreadScheduledExecutor { Runnable r ->
             final t = new Thread(r, 'flyte-heartbeat')
@@ -127,7 +174,7 @@ class StandaloneRun {
     void abort(String reason) {
         heartbeats?.shutdownNow()
         try {
-            client.abortRun(runId, reason)
+            runs.abortRun(runId, reason)
             log.info "Flyte run ${runName} aborted: ${url()}"
         }
         catch( Exception e ) {
@@ -141,12 +188,26 @@ class StandaloneRun {
     }
 
     /** The run's storage prefix: the root's input URI is `<prefix>/a0/inputs.pb` */
-    static String runOutputBase(Map uris) {
-        final inputs = uris?.inputsUri as String
+    static String runOutputBase(GetActionDataURIsResponse uris) {
+        final inputs = uris?.inputsUri
         final marker = "/${HEAD_ACTION}/"
         if( !inputs || !inputs.contains(marker) )
             throw new IllegalStateException("Unexpected storage location for the run's root action: $inputs")
         return inputs.substring(0, inputs.lastIndexOf(marker))
+    }
+
+    private static final String NAME_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
+
+    /**
+     * A run name like the ones Flyte generates: 20 lowercase letters and digits, here starting
+     * with `nf`. The run's inputs are stored under it before the run exists.
+     */
+    static String newRunName() {
+        final random = new java.security.SecureRandom()
+        final result = new StringBuilder('nf')
+        while( result.length() < 20 )
+            result.append(NAME_CHARS.charAt(random.nextInt(NAME_CHARS.length())))
+        return result.toString()
     }
 
     private void beat() {
@@ -162,28 +223,34 @@ class StandaloneRun {
         }
     }
 
-    protected Map rootSpec() {
-        return [
-            shortName: 'nextflow',
-            taskTemplate: [
-                id: [resourceType: 'TASK', org: config.org, project: config.project, domain: config.domain, name: 'nf.head', version: FlyteActionBuilder.TASK_VERSION],
-                type: 'container',
-                metadata: [
-                    // the control plane only sends a run through the Actions service, which task
-                    // actions are enqueued with, when its root declares a v2 runtime version
-                    runtime: [type: 'OTHER', flavor: 'nextflow', version: '2.10.0'],
-                    retries: [retries: 0],
-                ],
-                interface: [:],
-                container: [
-                    image: config.rootImage,
-                    command: ['python', '-c', WATCHER, FilesEx.toUriString(statusFile), FilesEx.toUriString(heartbeatFile), config.heartbeatTimeout.toSeconds().toString()],
-                    resources: [
-                        requests: [[name: 'CPU', value: '100m'], [name: 'MEMORY', value: '256Mi']],
-                        limits: [[name: 'CPU', value: '500m'], [name: 'MEMORY', value: '512Mi']],
-                    ],
-                ],
-            ],
-        ]
+    protected TaskSpec rootSpec() {
+        final template = TaskTemplate.newBuilder()
+            .setId(Identifier.newBuilder()
+                .setResourceType(ResourceType.TASK)
+                .setOrg(config.org)
+                .setProject(config.project)
+                .setDomain(config.domain)
+                .setName('nf.head')
+                .setVersion(FlyteActionBuilder.TASK_VERSION))
+            .setType('container')
+            .setMetadata(TaskMetadata.newBuilder()
+                // the control plane only sends a run through the Actions service, which task
+                // actions are enqueued with, when its root declares a v2 runtime version
+                .setRuntime(RuntimeMetadata.newBuilder().setType(RuntimeMetadata.RuntimeType.OTHER).setFlavor('nextflow').setVersion('2.10.0'))
+                .setRetries(RetryStrategy.newBuilder().setRetries(0)))
+            .setInterface(TypedInterface.getDefaultInstance())
+            .setContainer(Container.newBuilder()
+                .setImage(config.rootImage)
+                .addAllCommand(['python', '-c', WATCHER, FilesEx.toUriString(statusFile), FilesEx.toUriString(heartbeatFile), config.heartbeatTimeout.toSeconds().toString(), OUTPUT_PREFIX])
+                .setResources(Resources.newBuilder()
+                    .addRequests(resource(ResourceName.CPU, '100m'))
+                    .addRequests(resource(ResourceName.MEMORY, '256Mi'))
+                    .addLimits(resource(ResourceName.CPU, '500m'))
+                    .addLimits(resource(ResourceName.MEMORY, '512Mi'))))
+        return TaskSpec.newBuilder().setShortName('nextflow').setTaskTemplate(template).build()
+    }
+
+    private static ResourceEntry resource(ResourceName name, String value) {
+        ResourceEntry.newBuilder().setName(name).setValue(value).build()
     }
 }
