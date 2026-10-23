@@ -135,7 +135,9 @@ class FlyteActionBuilder {
     private Container container() {
         final result = Container.newBuilder()
             .setImage(image)
-            .addAllCommand(['bash', '-c', FlyteTaskLauncher.ENTRYPOINT])
+            // args, not command, so the image's ENTRYPOINT still runs, as with Nextflow's Docker
+            // and K8s executors: e.g. Wave's Pixi images put their tools on PATH in theirs
+            .addAllArgs(['bash', '-c', FlyteTaskLauncher.ENTRYPOINT])
             .setDataConfig(DataLoadingConfig.newBuilder()
                 .setEnabled(true)
                 .setInputPath(FlyteTaskLauncher.POD_INPUTS)

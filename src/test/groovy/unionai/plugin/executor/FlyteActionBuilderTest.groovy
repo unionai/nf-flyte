@@ -91,7 +91,8 @@ class FlyteActionBuilderTest extends Specification {
         and: 'copilot moves the data, keeping file names'
         def c = tmpl.container
         c.image == 'quay.io/biocontainers/fastqc:0.12.1'
-        c.commandList == ['bash', '-c', FlyteTaskLauncher.ENTRYPOINT]
+        c.commandCount == 0
+        c.argsList == ['bash', '-c', FlyteTaskLauncher.ENTRYPOINT]
         with(c.dataConfig) {
             enabled
             inputPath == '/var/inputs'
